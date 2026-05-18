@@ -4,7 +4,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use prost::Message;
 use roaring::RoaringBitmap;
 use turso_core::{
@@ -61,11 +61,53 @@ const MVCC_LOG_HEADER_SALT_START: usize = 8;
 const MVCC_LOG_HEADER_SALT_END: usize = 16;
 const MVCC_LOG_HEADER_RESERVED_START: usize = 16;
 const MVCC_LOG_HEADER_CRC_START: usize = 52;
+const MVCC_OP_UPSERT_TABLE: u8 = 0;
+const MVCC_OP_DELETE_TABLE: u8 = 1;
+const MVCC_OP_UPSERT_INDEX: u8 = 2;
+const MVCC_OP_DELETE_INDEX: u8 = 3;
+const MVCC_OP_UPDATE_HEADER: u8 = 4;
+const MVCC_OP_FLAG_PORTABLE_EXTENSION: u8 = 1 << 1;
+const MVCC_SQLITE_SCHEMA_TABLE_ID: i64 = -1;
+const MVCC_DELETE_EXT_IDENTITY_RECORD_FIELD: u64 = 1;
+const PORTABLE_TXN_META_CLIENT_KEY: &str = "client";
 const SQLITE_INTERNAL_PREFIX: &str = "sqlite_";
 const SQLITE_SCHEMA_TABLE: &str = "sqlite_schema";
 const TURSO_INTERNAL_PREFIX: &str = "__turso_internal_";
 const TURSO_CDC_TABLE_NAME: &str = "turso_cdc";
 const TURSO_CDC_VERSION_TABLE_NAME: &str = "turso_cdc_version";
+
+/// Core-owned portable MVCC transaction metadata carried in LML3 extension
+/// records. The authoritative row/schema/header changes are still in the
+/// recovery payload that follows the extension block.
+#[derive(prost::Message, Clone, PartialEq, Eq)]
+struct PortableLogicalTxn {
+    #[prost(uint64, tag = "1")]
+    end_offset: u64,
+    #[prost(uint64, tag = "2")]
+    commit_ts: u64,
+    #[prost(bytes = "bytes", repeated, tag = "12")]
+    string_table: Vec<Bytes>,
+    #[prost(message, repeated, tag = "13")]
+    object_map: Vec<PortableObjectMap>,
+    #[prost(message, repeated, tag = "14")]
+    meta: Vec<PortableMeta>,
+}
+
+#[derive(prost::Message, Clone, PartialEq, Eq)]
+struct PortableObjectMap {
+    #[prost(sint64, tag = "1")]
+    mv_table_id: i64,
+    #[prost(uint64, tag = "2")]
+    name_ref: u64,
+}
+
+#[derive(prost::Message, Clone, PartialEq, Eq)]
+struct PortableMeta {
+    #[prost(uint64, tag = "1")]
+    key_ref: u64,
+    #[prost(uint64, tag = "2")]
+    value_ref: u64,
+}
 
 /// Decodes and validates the stream-kind enum in a pull-updates response.
 fn pull_updates_stream_kind(header: &PullUpdatesRespProtoBody) -> Result<PullUpdatesStreamKind> {
@@ -250,7 +292,7 @@ fn logical_op_to_tape_operations(
 /// Logical MVCC streams may include schema or row changes for sync metadata,
 /// CDC, or SQLite-managed tables. Those tables are local implementation state,
 /// so replaying them would either duplicate metadata or make CDC capture itself.
-fn is_logically_replayable_table(name: &str) -> bool {
+pub(crate) fn is_logically_replayable_table(name: &str) -> bool {
     !name.starts_with(SQLITE_INTERNAL_PREFIX)
         && !name.starts_with(TURSO_INTERNAL_PREFIX)
         && name != TURSO_SYNC_TABLE_NAME
@@ -1003,6 +1045,449 @@ fn decode_mvcc_log_crc_seed(seed: &[u8]) -> Result<u32> {
     ))
 }
 
+fn read_mvcc_varint(buf: &[u8], cursor: &mut usize) -> Result<u64> {
+    let mut value = 0u64;
+    let mut shift = 0;
+    while *cursor < buf.len() {
+        let byte = buf[*cursor];
+        *cursor += 1;
+        value |= ((byte & 0x7f) as u64) << shift;
+        if byte & 0x80 == 0 {
+            return Ok(value);
+        }
+        shift += 7;
+        if shift >= 64 {
+            return Err(Error::DatabaseSyncEngineError(
+                "MVCC logical-log varint overflows u64".to_string(),
+            ));
+        }
+    }
+    Err(Error::DatabaseSyncEngineError(
+        "truncated MVCC logical-log varint".to_string(),
+    ))
+}
+
+fn skip_mvcc_proto_field(buf: &[u8], cursor: &mut usize, wire_type: u64) -> Result<()> {
+    match wire_type {
+        0 => {
+            let _ = read_mvcc_varint(buf, cursor)?;
+        }
+        2 => {
+            let len = usize::try_from(read_mvcc_varint(buf, cursor)?).map_err(|_| {
+                Error::DatabaseSyncEngineError(
+                    "MVCC logical-log protobuf length overflows usize".to_string(),
+                )
+            })?;
+            let end = cursor.checked_add(len).ok_or_else(|| {
+                Error::DatabaseSyncEngineError(
+                    "MVCC logical-log protobuf length overflow".to_string(),
+                )
+            })?;
+            if end > buf.len() {
+                return Err(Error::DatabaseSyncEngineError(
+                    "truncated MVCC logical-log protobuf field".to_string(),
+                ));
+            }
+            *cursor = end;
+        }
+        other => {
+            return Err(Error::DatabaseSyncEngineError(format!(
+                "unsupported MVCC logical-log protobuf wire type {other}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn decode_mvcc_delete_identity_record(extension: &[u8]) -> Result<Vec<u8>> {
+    let mut cursor = 0usize;
+    let mut identity_record = Vec::new();
+    while cursor < extension.len() {
+        let key = read_mvcc_varint(extension, &mut cursor)?;
+        let field = key >> 3;
+        let wire_type = key & 7;
+        if field == MVCC_DELETE_EXT_IDENTITY_RECORD_FIELD && wire_type == 2 {
+            let len = usize::try_from(read_mvcc_varint(extension, &mut cursor)?).map_err(|_| {
+                Error::DatabaseSyncEngineError(
+                    "MVCC delete identity record length overflows usize".to_string(),
+                )
+            })?;
+            let end = cursor.checked_add(len).ok_or_else(|| {
+                Error::DatabaseSyncEngineError(
+                    "MVCC delete identity record length overflow".to_string(),
+                )
+            })?;
+            if end > extension.len() {
+                return Err(Error::DatabaseSyncEngineError(
+                    "truncated MVCC delete identity record".to_string(),
+                ));
+            }
+            identity_record = extension[cursor..end].to_vec();
+            cursor = end;
+        } else {
+            skip_mvcc_proto_field(extension, &mut cursor, wire_type)?;
+        }
+    }
+    Ok(identity_record)
+}
+
+fn portable_string(strings: &[String], idx: u64, context: &str) -> Result<String> {
+    let idx = usize::try_from(idx).map_err(|_| {
+        Error::DatabaseSyncEngineError(format!("{context} string ref overflows usize"))
+    })?;
+    strings.get(idx).cloned().ok_or_else(|| {
+        Error::DatabaseSyncEngineError(format!("{context} references missing string {idx}"))
+    })
+}
+
+fn portable_txn_strings(txn: &PortableLogicalTxn) -> Result<Vec<String>> {
+    txn.string_table
+        .iter()
+        .map(|bytes| {
+            String::from_utf8(bytes.to_vec()).map_err(|err| {
+                Error::DatabaseSyncEngineError(format!(
+                    "portable MVCC logical-log string is not UTF-8: {err}"
+                ))
+            })
+        })
+        .collect()
+}
+
+fn portable_object_names(txn: &PortableLogicalTxn) -> Result<BTreeMap<i64, String>> {
+    let strings = portable_txn_strings(txn)?;
+    let mut names = BTreeMap::new();
+    for object in &txn.object_map {
+        names.insert(
+            object.mv_table_id,
+            portable_string(&strings, object.name_ref, "portable object map")?,
+        );
+    }
+    Ok(names)
+}
+
+fn portable_origin_client_id(txn: &PortableLogicalTxn) -> Result<String> {
+    let strings = portable_txn_strings(txn)?;
+    for meta in &txn.meta {
+        let key = portable_string(&strings, meta.key_ref, "portable metadata key")?;
+        if key == PORTABLE_TXN_META_CLIENT_KEY {
+            return portable_string(&strings, meta.value_ref, "portable metadata value");
+        }
+    }
+    Ok(String::new())
+}
+
+#[derive(Clone)]
+struct DecodedSchemaRow {
+    row_type: String,
+    name: String,
+    sql: String,
+}
+
+#[derive(Default)]
+struct SchemaRowDelta {
+    old: Option<DecodedSchemaRow>,
+    new: Option<DecodedSchemaRow>,
+}
+
+fn schema_text_value(value: &Value, field: &str) -> Result<String> {
+    match value {
+        Value::Text(text) => Ok(text.as_str().to_string()),
+        Value::Null => Ok(String::new()),
+        other => Err(Error::DatabaseSyncEngineError(format!(
+            "sqlite_schema.{field} must be text, got {other:?}"
+        ))),
+    }
+}
+
+fn schema_integer_value(value: &Value, field: &str) -> Result<i64> {
+    match value.as_int() {
+        Some(value) => Ok(value),
+        None => Err(Error::DatabaseSyncEngineError(format!(
+            "sqlite_schema.{field} must be integer, got {value:?}"
+        ))),
+    }
+}
+
+fn decode_schema_row(record: &[u8]) -> Result<DecodedSchemaRow> {
+    let values = parse_bin_record(record)?;
+    if values.len() < 5 {
+        return Err(Error::DatabaseSyncEngineError(format!(
+            "sqlite_schema record must have at least 5 columns, got {}",
+            values.len()
+        )));
+    }
+    Ok(DecodedSchemaRow {
+        row_type: schema_text_value(&values[0], "type")?,
+        name: schema_text_value(&values[1], "name")?,
+        sql: {
+            let _rootpage = schema_integer_value(&values[3], "rootpage")?;
+            schema_text_value(&values[4], "sql")?
+        },
+    })
+}
+
+fn logical_schema_kind_from_row(row: &DecodedSchemaRow) -> Result<LogicalSchemaKind> {
+    if row.row_type.eq_ignore_ascii_case("table") {
+        Ok(LogicalSchemaKind::Table)
+    } else if row.row_type.eq_ignore_ascii_case("index") {
+        Ok(LogicalSchemaKind::Index)
+    } else if row.row_type.eq_ignore_ascii_case("trigger") {
+        Ok(LogicalSchemaKind::Trigger)
+    } else if row.row_type.eq_ignore_ascii_case("view") {
+        Ok(LogicalSchemaKind::View)
+    } else {
+        Err(Error::DatabaseSyncEngineError(format!(
+            "unsupported sqlite_schema object type {}",
+            row.row_type
+        )))
+    }
+}
+
+fn schema_logical_op(row: &DecodedSchemaRow, action: LogicalSchemaAction) -> Result<LogicalOp> {
+    Ok(LogicalOp {
+        op_type: LogicalOpType::Schema as i32,
+        table_name: String::new(),
+        rowid: 0,
+        record: Bytes::new(),
+        sql: if action == LogicalSchemaAction::Drop {
+            String::new()
+        } else {
+            row.sql.clone()
+        },
+        user_version: None,
+        application_id: None,
+        schema_action: Some(action as i32),
+        schema_kind: Some(logical_schema_kind_from_row(row)? as i32),
+        schema_name: row.name.clone(),
+        stable_table_id: 0,
+    })
+}
+
+fn append_schema_ops(deltas: BTreeMap<i64, SchemaRowDelta>, ops: &mut Vec<LogicalOp>) -> Result<()> {
+    for delta in deltas.into_values() {
+        match (delta.old, delta.new) {
+            (Some(old), Some(new)) => {
+                if is_logically_replayable_table(&old.name) {
+                    ops.push(schema_logical_op(&new, LogicalSchemaAction::Refresh)?);
+                }
+            }
+            (None, Some(new)) => {
+                if is_logically_replayable_table(&new.name) {
+                    ops.push(schema_logical_op(&new, LogicalSchemaAction::Create)?);
+                }
+            }
+            (Some(old), None) => {
+                if is_logically_replayable_table(&old.name) {
+                    ops.push(schema_logical_op(&old, LogicalSchemaAction::Drop)?);
+                }
+            }
+            (None, None) => {}
+        }
+    }
+    Ok(())
+}
+
+fn decode_update_header_op(payload: &[u8]) -> Result<LogicalOp> {
+    if payload.len() < 72 || &payload[..16] != b"SQLite format 3\0" {
+        return Err(Error::DatabaseSyncEngineError(
+            "invalid MVCC UPDATE_HEADER payload".to_string(),
+        ));
+    }
+    Ok(LogicalOp {
+        op_type: LogicalOpType::UpdateHeader as i32,
+        table_name: String::new(),
+        rowid: 0,
+        record: Bytes::new(),
+        sql: String::new(),
+        user_version: Some(u32::from_be_bytes(payload[60..64].try_into().unwrap())),
+        application_id: Some(u32::from_be_bytes(payload[68..72].try_into().unwrap())),
+        schema_action: None,
+        schema_kind: None,
+        schema_name: String::new(),
+        stable_table_id: 0,
+    })
+}
+
+fn decode_recovery_ops_to_logical_txn(
+    portable_txn: PortableLogicalTxn,
+    recovery_payload: &[u8],
+    op_count: u32,
+) -> Result<LogicalTxnData> {
+    let object_names = portable_object_names(&portable_txn)?;
+    let origin_client_id = portable_origin_client_id(&portable_txn)?;
+    let mut cursor = 0usize;
+    let mut schema_deltas = BTreeMap::<i64, SchemaRowDelta>::new();
+    let mut row_ops = Vec::new();
+    let mut header_ops = Vec::new();
+
+    for _ in 0..op_count {
+        if recovery_payload.len().saturating_sub(cursor) < 6 {
+            return Err(Error::DatabaseSyncEngineError(
+                "truncated MVCC logical-log recovery op".to_string(),
+            ));
+        }
+        let tag = recovery_payload[cursor];
+        let flags = recovery_payload[cursor + 1];
+        let table_id = i32::from_le_bytes(
+            recovery_payload[cursor + 2..cursor + 6]
+                .try_into()
+                .unwrap(),
+        ) as i64;
+        cursor += 6;
+        let payload_len = usize::try_from(read_mvcc_varint(recovery_payload, &mut cursor)?)
+            .map_err(|_| {
+                Error::DatabaseSyncEngineError(
+                    "MVCC logical-log op payload length overflows usize".to_string(),
+                )
+            })?;
+        let payload_end = cursor.checked_add(payload_len).ok_or_else(|| {
+            Error::DatabaseSyncEngineError("MVCC logical-log op payload overflow".to_string())
+        })?;
+        if payload_end > recovery_payload.len() {
+            return Err(Error::DatabaseSyncEngineError(
+                "truncated MVCC logical-log op payload".to_string(),
+            ));
+        }
+        let payload = &recovery_payload[cursor..payload_end];
+        cursor = payload_end;
+        let portable_extension = if flags & MVCC_OP_FLAG_PORTABLE_EXTENSION == 0 {
+            &[][..]
+        } else {
+            let extension_len = usize::try_from(read_mvcc_varint(recovery_payload, &mut cursor)?)
+                .map_err(|_| {
+                    Error::DatabaseSyncEngineError(
+                        "MVCC logical-log op extension length overflows usize".to_string(),
+                    )
+                })?;
+            let extension_end = cursor.checked_add(extension_len).ok_or_else(|| {
+                Error::DatabaseSyncEngineError(
+                    "MVCC logical-log op extension length overflow".to_string(),
+                )
+            })?;
+            if extension_end > recovery_payload.len() {
+                return Err(Error::DatabaseSyncEngineError(
+                    "truncated MVCC logical-log op extension".to_string(),
+                ));
+            }
+            let extension = &recovery_payload[cursor..extension_end];
+            cursor = extension_end;
+            extension
+        };
+
+        match tag {
+            MVCC_OP_UPSERT_TABLE => {
+                let mut payload_cursor = 0usize;
+                let rowid = read_mvcc_varint(payload, &mut payload_cursor)? as i64;
+                let record = &payload[payload_cursor..];
+                if table_id == MVCC_SQLITE_SCHEMA_TABLE_ID {
+                    schema_deltas.entry(rowid).or_default().new = Some(decode_schema_row(record)?);
+                } else if let Some(table_name) = object_names.get(&table_id) {
+                    row_ops.push(LogicalOp {
+                        op_type: LogicalOpType::UpsertRow as i32,
+                        table_name: table_name.clone(),
+                        rowid,
+                        record: Bytes::copy_from_slice(record),
+                        sql: String::new(),
+                        user_version: None,
+                        application_id: None,
+                        schema_action: None,
+                        schema_kind: None,
+                        schema_name: String::new(),
+                        stable_table_id: 0,
+                    });
+                }
+            }
+            MVCC_OP_DELETE_TABLE => {
+                let mut payload_cursor = 0usize;
+                let rowid = read_mvcc_varint(payload, &mut payload_cursor)? as i64;
+                if table_id == MVCC_SQLITE_SCHEMA_TABLE_ID {
+                    let identity_record = decode_mvcc_delete_identity_record(portable_extension)?;
+                    if identity_record.is_empty() {
+                        return Err(Error::DatabaseSyncEngineError(
+                            "MVCC sqlite_schema delete is missing portable identity record"
+                                .to_string(),
+                        ));
+                    }
+                    schema_deltas.entry(rowid).or_default().old =
+                        Some(decode_schema_row(&identity_record)?);
+                } else if let Some(table_name) = object_names.get(&table_id) {
+                    row_ops.push(LogicalOp {
+                        op_type: LogicalOpType::DeleteRow as i32,
+                        table_name: table_name.clone(),
+                        rowid,
+                        record: Bytes::new(),
+                        sql: String::new(),
+                        user_version: None,
+                        application_id: None,
+                        schema_action: None,
+                        schema_kind: None,
+                        schema_name: String::new(),
+                        stable_table_id: 0,
+                    });
+                }
+            }
+            MVCC_OP_UPSERT_INDEX | MVCC_OP_DELETE_INDEX => {}
+            MVCC_OP_UPDATE_HEADER => {
+                header_ops.push(decode_update_header_op(payload)?);
+            }
+            other => {
+                return Err(Error::DatabaseSyncEngineError(format!(
+                    "unknown MVCC logical-log recovery op tag {other}"
+                )));
+            }
+        }
+    }
+    if cursor != recovery_payload.len() {
+        return Err(Error::DatabaseSyncEngineError(
+            "MVCC logical-log recovery payload has trailing bytes".to_string(),
+        ));
+    }
+
+    let mut ops = header_ops;
+    append_schema_ops(schema_deltas, &mut ops)?;
+    ops.extend(row_ops);
+
+    Ok(LogicalTxnData {
+        end_offset: portable_txn.end_offset,
+        commit_ts: portable_txn.commit_ts,
+        ops,
+        origin_client_id,
+    })
+}
+
+async fn append_decoded_mvcc_frame_to_txns_file<Ctx>(
+    coro: &Coro<Ctx>,
+    txns_file: &Arc<dyn turso_core::File>,
+    txns_offset: &mut u64,
+    portable_payload: &[u8],
+    recovery_payload: &[u8],
+    op_count: u32,
+) -> Result<(usize, usize)> {
+    let mut payload_bytes = BytesMut::from(portable_payload);
+    let mut txns = 0usize;
+    let mut ops = 0usize;
+    while let Some(portable_txn) =
+        take_proto_message_from_bytes::<PortableLogicalTxn>(&mut payload_bytes)?
+    {
+        let txn = decode_recovery_ops_to_logical_txn(portable_txn, recovery_payload, op_count)?;
+        ops += txn.ops.len();
+        txns += 1;
+        append_file_bytes(
+            coro,
+            txns_file,
+            txns_offset,
+            &txn.encode_length_delimited_to_vec(),
+        )
+        .await?;
+    }
+    if !payload_bytes.is_empty() {
+        return Err(Error::DatabaseSyncEngineError(
+            "MVCC logical-log portable payload has trailing partial protobuf message".to_string(),
+        ));
+    }
+    Ok((txns, ops))
+}
+
 async fn decode_raw_mvcc_logical_log_to_file<Ctx>(
     coro: &Coro<Ctx>,
     txns_file: &Arc<dyn turso_core::File>,
@@ -1112,6 +1597,7 @@ async fn decode_raw_mvcc_logical_log_to_file<Ctx>(
                         "MVCC logical-log recovery payload size overflows usize".to_string(),
                     )
                 })?;
+            let op_count = read_u32_le(range_body, pos + 12)?;
             let (extension_size, extension_record_count) = if has_extension_header {
                 let extension_size =
                     usize::try_from(read_u64_le(range_body, pos + 24)?).map_err(|_| {
@@ -1145,13 +1631,15 @@ async fn decode_raw_mvcc_logical_log_to_file<Ctx>(
 
             let extension_start = pos
                 .checked_add(header_size)
-                .and_then(|v| v.checked_add(payload_size))
                 .ok_or_else(|| {
                     Error::DatabaseSyncEngineError(
                         "MVCC logical-log frame offset overflow".to_string(),
                     )
                 })?;
-            let trailer_start = extension_start.checked_add(extension_size).ok_or_else(|| {
+            let recovery_start = extension_start.checked_add(extension_size).ok_or_else(|| {
+                Error::DatabaseSyncEngineError("MVCC logical-log frame offset overflow".to_string())
+            })?;
+            let trailer_start = recovery_start.checked_add(payload_size).ok_or_else(|| {
                 Error::DatabaseSyncEngineError("MVCC logical-log frame offset overflow".to_string())
             })?;
             let frame_end = trailer_start
@@ -1184,36 +1672,42 @@ async fn decode_raw_mvcc_logical_log_to_file<Ctx>(
                 running_crc = Some(stored_crc);
             }
 
-            if extension_size > 0 {
-                let extension_block = &range_body[extension_start..trailer_start];
-                let portable_payload = find_mvcc_extension_payload(
-                    extension_block,
-                    extension_record_count,
-                    MVCC_EXTENSION_TYPE_PORTABLE_CHANGES,
-                )?;
-                if portable_payload.is_empty() {
-                    pos = frame_end;
-                    continue;
+            if extension_size == 0 {
+                if op_count != 0 {
+                    return Err(Error::DatabaseSyncEngineError(format!(
+                        "MVCC logical-log frame at range offset {frame_start} has {op_count} recovery ops but no portable logical-change extension"
+                    )));
                 }
-                let mut payload_bytes = BytesMut::from(portable_payload.as_slice());
-                let mut frame_txns = 0usize;
-                let mut frame_ops = 0usize;
-                while let Some(txn) =
-                    take_proto_message_from_bytes::<LogicalTxnData>(&mut payload_bytes)?
-                {
-                    frame_ops += txn.ops.len();
-                    frame_txns += 1;
-                }
-                if !payload_bytes.is_empty() {
-                    return Err(Error::DatabaseSyncEngineError(
-                        "MVCC logical-log portable payload has trailing partial protobuf message"
-                            .to_string(),
-                    ));
-                }
-                txns += frame_txns;
-                ops += frame_ops;
-                append_file_bytes(coro, txns_file, &mut txns_offset, &portable_payload).await?;
+                pos = frame_end;
+                continue;
             }
+            let extension_block = &range_body[extension_start..recovery_start];
+            let recovery_payload = &range_body[recovery_start..trailer_start];
+            let portable_payload = find_mvcc_extension_payload(
+                extension_block,
+                extension_record_count,
+                MVCC_EXTENSION_TYPE_PORTABLE_CHANGES,
+            )?;
+            if portable_payload.is_empty() {
+                if op_count != 0 {
+                    return Err(Error::DatabaseSyncEngineError(format!(
+                        "MVCC logical-log frame at range offset {frame_start} has {op_count} recovery ops but an empty portable logical-change extension"
+                    )));
+                }
+                pos = frame_end;
+                continue;
+            }
+            let (frame_txns, frame_ops) = append_decoded_mvcc_frame_to_txns_file(
+                coro,
+                txns_file,
+                &mut txns_offset,
+                &portable_payload,
+                recovery_payload,
+                op_count,
+            )
+            .await?;
+            txns += frame_txns;
+            ops += frame_ops;
             pos = frame_end;
         }
         previous_range_boundary = Some((range.generation, range.end_offset));
@@ -2506,6 +3000,7 @@ pub async fn push_logical_changes<IO: SyncEngineIo, Ctx>(
     tracing::info!("push_logical_changes: client_id={client_id}");
     let source_conn = connect_untracked(source)?;
     let source_is_mvcc = source_journal_mode_is_mvcc(ctx.coro, &source_conn).await?;
+    let logical_mvcc_push_active = source_is_mvcc && opts.logical_mvcc_pull;
 
     let (source_pull_gen, mut last_change_id) =
         fetch_last_change_id(ctx, &source_conn, client_id).await?;
@@ -2547,7 +3042,17 @@ pub async fn push_logical_changes<IO: SyncEngineIo, Ctx>(
             DatabaseTapeOperation::SchemaReplay(_) => {
                 panic!("changes iterator must not use SchemaReplay option")
             }
-            DatabaseTapeOperation::RowChange(change) => batch.push(change),
+            DatabaseTapeOperation::RowChange(change) => {
+                if !logical_mvcc_push_active {
+                    if change.table_name == TURSO_SYNC_TABLE_NAME {
+                        continue;
+                    }
+                    if opts.tables_ignore.iter().any(|x| &change.table_name == x) {
+                        continue;
+                    }
+                }
+                batch.push(change);
+            }
             DatabaseTapeOperation::Commit => {
                 // push batch if we reach threshold OR if this is last operation
                 let must_push =
@@ -2563,7 +3068,7 @@ pub async fn push_logical_changes<IO: SyncEngineIo, Ctx>(
                     client_id,
                     source_pull_gen,
                     last_change_id,
-                    source_is_mvcc,
+                    logical_mvcc_push_active,
                 )
                 .await?;
                 total_rows_changed += rows_changed;
@@ -2600,15 +3105,20 @@ async fn send_push_batch<IO: SyncEngineIo, Ctx>(
     client_id: &str,
     source_pull_gen: i64,
     mut last_change_id: Option<i64>,
-    source_is_mvcc: bool,
+    logical_mvcc_push_active: bool,
 ) -> Result<(i64, i64)> {
+    let should_transform_change = |change: &DatabaseTapeRowChange| {
+        is_logically_replayable_table(&change.table_name)
+            && !opts.tables_ignore.iter().any(|x| &change.table_name == x)
+    };
+    let should_send_change = |change: &DatabaseTapeRowChange| {
+        is_local_cdc_push_replayable_table(&change.table_name)
+            && !opts.tables_ignore.iter().any(|x| &change.table_name == x)
+    };
     let transform_changes = if opts.use_transform {
         batch_changes
             .iter()
-            .filter(|change| {
-                is_local_cdc_push_replayable_table(&change.table_name)
-                    && !opts.tables_ignore.iter().any(|x| &change.table_name == x)
-            })
+            .filter(|change| should_transform_change(change))
             .cloned()
             .collect::<Vec<_>>()
     } else {
@@ -2638,7 +3148,7 @@ async fn send_push_batch<IO: SyncEngineIo, Ctx>(
     let mut add_column_step_indices = std::collections::HashSet::new();
     let initial_last_change_id = last_change_id;
     let mut sql_over_http_requests = Vec::new();
-    if should_send_mvcc_log_meta(opts.protocol_version_hint, source_is_mvcc) {
+    if should_send_mvcc_log_meta(opts.protocol_version_hint, logical_mvcc_push_active) {
         sql_over_http_requests.push(BatchStep {
             stmt: Stmt {
                 sql: Some(format!(
@@ -2681,6 +3191,7 @@ async fn send_push_batch<IO: SyncEngineIo, Ctx>(
             last_change_id.is_none() || last_change_id.unwrap() < change_id,
             "change id must be strictly increasing: last_change_id={last_change_id:?}, change.change_id={change_id}"
         );
+
         if last_change_id.is_some() && last_change_id.unwrap() + 1 != change_id {
             tracing::debug!(
                 "out of order change sequence: {} -> {}",
@@ -2690,9 +3201,7 @@ async fn send_push_batch<IO: SyncEngineIo, Ctx>(
         }
         last_change_id = Some(change_id);
 
-        if !is_local_cdc_push_replayable_table(&change.table_name)
-            || opts.tables_ignore.iter().any(|x| &change.table_name == x)
-        {
+        if !should_send_change(change) {
             tracing::debug!(
                 "push_logical_changes: client_id={client_id}, acknowledge skipped local CDC row: change_id={} table={}",
                 change.change_id,
@@ -2701,13 +3210,17 @@ async fn send_push_batch<IO: SyncEngineIo, Ctx>(
             continue;
         }
 
-        let transform_result = if let Some(transformed) = transformed.as_mut() {
-            let result = std::mem::replace(
-                &mut transformed[transform_index],
-                DatabaseRowTransformResult::Skip,
-            );
-            transform_index += 1;
-            result
+        let transform_result = if should_transform_change(change) {
+            if let Some(transformed) = transformed.as_mut() {
+                let result = std::mem::replace(
+                    &mut transformed[transform_index],
+                    DatabaseRowTransformResult::Skip,
+                );
+                transform_index += 1;
+                result
+            } else {
+                DatabaseRowTransformResult::Keep
+            }
         } else {
             DatabaseRowTransformResult::Keep
         };
@@ -2842,9 +3355,9 @@ fn quote_sql_string(value: &str) -> String {
 
 fn should_send_mvcc_log_meta(
     protocol_version_hint: DatabaseSyncEngineProtocolVersion,
-    source_is_mvcc: bool,
+    logical_mvcc_push_active: bool,
 ) -> bool {
-    source_is_mvcc && protocol_version_hint == DatabaseSyncEngineProtocolVersion::V1
+    logical_mvcc_push_active && protocol_version_hint == DatabaseSyncEngineProtocolVersion::V1
 }
 
 async fn source_journal_mode_is_mvcc<Ctx>(
@@ -3609,12 +4122,13 @@ mod tests {
             apply_logical_transactions, for_each_proto_message_in_file,
             logical_txn_acknowledges_client, logical_txn_to_tape_operations, pull_updates_v1,
             read_last_change_id, resolve_logical_push_floor_change_id, update_last_change_id,
-            wait_proto_message, PullUpdatesV1Result, SyncEngineIoStats, SyncOperationCtx,
-            MVCC_EXTENSION_RECORD_HEADER_SIZE, MVCC_EXTENSION_TYPE_PORTABLE_CHANGES,
-            MVCC_LOG_HEADER_CRC_START, MVCC_LOG_HEADER_SIZE, MVCC_LOG_MAGIC, MVCC_LOG_VERSION,
+            wait_proto_message, PortableLogicalTxn, PortableMeta, PullUpdatesV1Result,
+            SyncEngineIoStats, SyncOperationCtx, MVCC_EXTENSION_RECORD_HEADER_SIZE,
+            MVCC_EXTENSION_TYPE_PORTABLE_CHANGES, MVCC_LOG_HEADER_CRC_START, MVCC_LOG_HEADER_SIZE,
+            MVCC_LOG_MAGIC, MVCC_LOG_VERSION, MVCC_OP_UPSERT_TABLE, MVCC_SQLITE_SCHEMA_TABLE_ID,
             MVCC_TX_END_MAGIC, MVCC_TX_EXT_FRAME_MAGIC, MVCC_TX_EXT_HEADER_SIZE,
-            MVCC_TX_FLAG_HAS_EXTENSION_BLOCK, MVCC_TX_TRAILER_SIZE, TURSO_SYNC_CREATE_TABLE,
-            TURSO_SYNC_TABLE_NAME,
+            MVCC_TX_FLAG_HAS_EXTENSION_BLOCK, MVCC_TX_FRAME_MAGIC, MVCC_TX_TRAILER_SIZE,
+            PORTABLE_TXN_META_CLIENT_KEY, TURSO_SYNC_CREATE_TABLE, TURSO_SYNC_TABLE_NAME,
         },
         database_tape::run_stmt_once,
         database_tape::{DatabaseReplaySessionOpts, DatabaseTape},
@@ -3822,6 +4336,7 @@ mod tests {
 
     fn record(values: &[turso_core::Value]) -> Bytes {
         turso_core::types::ImmutableRecord::from_values(values.iter(), values.len())
+            .unwrap()
             .into_payload()
             .into()
     }
@@ -4159,22 +4674,122 @@ mod tests {
         ));
     }
 
+    fn write_test_varint(mut value: u64, out: &mut Vec<u8>) {
+        while value >= 0x80 {
+            out.push((value as u8) | 0x80);
+            value >>= 7;
+        }
+        out.push(value as u8);
+    }
+
+    fn test_schema_record(op: &LogicalOp) -> Bytes {
+        let kind = LogicalSchemaKind::try_from(op.schema_kind.unwrap()).unwrap();
+        let row_type = match kind {
+            LogicalSchemaKind::Table => "table",
+            LogicalSchemaKind::Index => "index",
+            LogicalSchemaKind::Trigger => "trigger",
+            LogicalSchemaKind::View => "view",
+        };
+        let rootpage = if op.stable_table_id == 0 {
+            2
+        } else {
+            op.stable_table_id as i64
+        };
+        record(&[
+            text_value(row_type),
+            text_value(&op.schema_name),
+            text_value(&op.schema_name),
+            turso_core::Value::from_i64(rootpage),
+            text_value(&op.sql),
+        ])
+    }
+
+    fn append_test_table_upsert(
+        recovery_payload: &mut Vec<u8>,
+        table_id: i64,
+        rowid: i64,
+        record: &[u8],
+    ) {
+        let mut payload = Vec::new();
+        write_test_varint(rowid as u64, &mut payload);
+        payload.extend_from_slice(record);
+        recovery_payload.push(MVCC_OP_UPSERT_TABLE);
+        recovery_payload.push(0);
+        recovery_payload.extend_from_slice(&(table_id as i32).to_le_bytes());
+        write_test_varint(payload.len() as u64, recovery_payload);
+        recovery_payload.extend_from_slice(&payload);
+    }
+
+    fn test_portable_payload(txn: &LogicalTxnData) -> Vec<u8> {
+        let mut portable_txn = PortableLogicalTxn {
+            end_offset: txn.end_offset,
+            commit_ts: txn.commit_ts,
+            string_table: Vec::new(),
+            object_map: Vec::new(),
+            meta: Vec::new(),
+        };
+        if !txn.origin_client_id.is_empty() {
+            portable_txn
+                .string_table
+                .push(Bytes::from_static(PORTABLE_TXN_META_CLIENT_KEY.as_bytes()));
+            portable_txn
+                .string_table
+                .push(Bytes::from(txn.origin_client_id.clone()));
+            portable_txn.meta.push(PortableMeta {
+                key_ref: 0,
+                value_ref: 1,
+            });
+        }
+        portable_txn.encode_length_delimited_to_vec()
+    }
+
+    fn test_frame_payloads(input_payload: &[u8]) -> (Vec<u8>, Vec<u8>, u32) {
+        let Ok(txn) = LogicalTxnData::decode_length_delimited(input_payload) else {
+            return (input_payload.to_vec(), Vec::new(), 0);
+        };
+        if txn.ops.is_empty() && txn.origin_client_id.is_empty() {
+            return (input_payload.to_vec(), Vec::new(), 0);
+        }
+
+        let mut recovery_payload = Vec::new();
+        let mut op_count = 0u32;
+        let mut schema_rowid = 1i64;
+        for op in &txn.ops {
+            if LogicalOpType::try_from(op.op_type) != Ok(LogicalOpType::Schema) {
+                continue;
+            }
+            let record = test_schema_record(op);
+            append_test_table_upsert(
+                &mut recovery_payload,
+                MVCC_SQLITE_SCHEMA_TABLE_ID,
+                schema_rowid,
+                &record,
+            );
+            schema_rowid += 1;
+            op_count += 1;
+        }
+
+        (test_portable_payload(&txn), recovery_payload, op_count)
+    }
+
     fn raw_mvcc_log_frame(commit_ts: u64, portable_payload: &[u8]) -> Vec<u8> {
+        let (portable_payload, recovery_payload, op_count) = test_frame_payloads(portable_payload);
         let mut extension_block = Vec::new();
         extension_block.extend_from_slice(&MVCC_EXTENSION_TYPE_PORTABLE_CHANGES.to_le_bytes());
         extension_block.extend_from_slice(&0u16.to_le_bytes());
         extension_block.extend_from_slice(&(portable_payload.len() as u32).to_le_bytes());
-        extension_block.extend_from_slice(portable_payload);
+        extension_block.extend_from_slice(&portable_payload);
 
         let mut frame = Vec::new();
         frame.extend_from_slice(&MVCC_TX_EXT_FRAME_MAGIC.to_le_bytes());
-        frame.extend_from_slice(&0u64.to_le_bytes());
-        frame.extend_from_slice(&0u32.to_le_bytes());
+        frame.extend_from_slice(&(recovery_payload.len() as u64).to_le_bytes());
+        frame.extend_from_slice(&op_count.to_le_bytes());
         frame.extend_from_slice(&commit_ts.to_le_bytes());
         frame.extend_from_slice(&(extension_block.len() as u64).to_le_bytes());
         frame.extend_from_slice(&1u32.to_le_bytes());
         frame.extend_from_slice(&MVCC_TX_FLAG_HAS_EXTENSION_BLOCK.to_le_bytes());
         frame.extend_from_slice(&extension_block);
+        frame.extend_from_slice(&recovery_payload);
         frame.extend_from_slice(&0u32.to_le_bytes());
         frame.extend_from_slice(&MVCC_TX_END_MAGIC.to_le_bytes());
         frame
@@ -4197,6 +4812,38 @@ mod tests {
         previous_crc: u32,
     ) -> (Vec<u8>, u32) {
         let mut frame = raw_mvcc_log_frame(commit_ts, portable_payload);
+        let trailer_start = frame.len() - MVCC_TX_TRAILER_SIZE;
+        let crc = crc32c::crc32c_append(previous_crc, &frame[..trailer_start]);
+        frame[trailer_start..trailer_start + 4].copy_from_slice(&crc.to_le_bytes());
+        (frame, crc)
+    }
+
+    fn raw_mvcc_recovery_only_frame_with_crc(commit_ts: u64, previous_crc: u32) -> (Vec<u8>, u32) {
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&MVCC_TX_FRAME_MAGIC.to_le_bytes());
+        frame.extend_from_slice(&0u64.to_le_bytes());
+        frame.extend_from_slice(&0u32.to_le_bytes());
+        frame.extend_from_slice(&commit_ts.to_le_bytes());
+        frame.extend_from_slice(&0u32.to_le_bytes());
+        frame.extend_from_slice(&MVCC_TX_END_MAGIC.to_le_bytes());
+        let trailer_start = frame.len() - MVCC_TX_TRAILER_SIZE;
+        let crc = crc32c::crc32c_append(previous_crc, &frame[..trailer_start]);
+        frame[trailer_start..trailer_start + 4].copy_from_slice(&crc.to_le_bytes());
+        (frame, crc)
+    }
+
+    fn raw_mvcc_recovery_frame_without_portable_extension_with_crc(
+        commit_ts: u64,
+        previous_crc: u32,
+    ) -> (Vec<u8>, u32) {
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&MVCC_TX_FRAME_MAGIC.to_le_bytes());
+        frame.extend_from_slice(&1u64.to_le_bytes());
+        frame.extend_from_slice(&1u32.to_le_bytes());
+        frame.extend_from_slice(&commit_ts.to_le_bytes());
+        frame.push(0);
+        frame.extend_from_slice(&0u32.to_le_bytes());
+        frame.extend_from_slice(&MVCC_TX_END_MAGIC.to_le_bytes());
         let trailer_start = frame.len() - MVCC_TX_TRAILER_SIZE;
         let crc = crc32c::crc32c_append(previous_crc, &frame[..trailer_start]);
         frame[trailer_start..trailer_start + 4].copy_from_slice(&crc.to_le_bytes());
@@ -4364,6 +5011,164 @@ mod tests {
         assert!(
             err.to_string().contains("missing CRC seed"),
             "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn raw_mvcc_log_decoder_skips_recovery_only_frame() {
+        let crc_seed = crc32c::crc32c(&1234u64.to_le_bytes());
+        let (raw_frame, _) = raw_mvcc_recovery_only_frame_with_crc(77, crc_seed);
+        let range_start = MVCC_LOG_HEADER_SIZE as u64;
+        let range_end = range_start + raw_frame.len() as u64;
+        let header = PullUpdatesRespProtoBody {
+            server_revision: format!("g1:o{range_end}"),
+            db_size: 0,
+            raw_encoding: None,
+            zstd_encoding: None,
+            stream_kind: PullUpdatesStreamKind::MvccLogicalLog as i32,
+            apply_mode: PullUpdatesApplyMode::Incremental as i32,
+            mvcc_log: Some(server_proto::MvccLogicalLogMetadataProto {
+                format: "lml3".to_string(),
+                checkpoint_transition: false,
+                ranges: vec![server_proto::MvccLogicalLogRangeProto {
+                    generation: 1,
+                    start_offset: range_start,
+                    end_offset: range_end,
+                    starts_with_header: false,
+                    crc_seed: Some(crc_seed.to_le_bytes().to_vec()),
+                }],
+            }),
+        };
+
+        assert_eq!(
+            decode_raw_mvcc_log_for_test(header, raw_frame).unwrap(),
+            vec![]
+        );
+    }
+
+    #[test]
+    fn raw_mvcc_log_decoder_skips_recovery_only_frame_before_portable_frame() {
+        let txn = LogicalTxnData {
+            end_offset: 136,
+            commit_ts: 88,
+            origin_client_id: String::new(),
+            ops: vec![schema_op(
+                LogicalSchemaAction::Create,
+                LogicalSchemaKind::Table,
+                "t",
+                Some("CREATE TABLE t(x INTEGER PRIMARY KEY, y TEXT)"),
+            )],
+        };
+        let portable_payload = txn.encode_length_delimited_to_vec();
+        let crc_seed = crc32c::crc32c(&1234u64.to_le_bytes());
+        let (recovery_frame, recovery_crc) = raw_mvcc_recovery_only_frame_with_crc(77, crc_seed);
+        let (portable_frame, _) = raw_mvcc_log_frame_with_crc(88, &portable_payload, recovery_crc);
+        let range_start = MVCC_LOG_HEADER_SIZE as u64;
+        let range_end = range_start + recovery_frame.len() as u64 + portable_frame.len() as u64;
+        let header = PullUpdatesRespProtoBody {
+            server_revision: format!("g1:o{range_end}"),
+            db_size: 0,
+            raw_encoding: None,
+            zstd_encoding: None,
+            stream_kind: PullUpdatesStreamKind::MvccLogicalLog as i32,
+            apply_mode: PullUpdatesApplyMode::Incremental as i32,
+            mvcc_log: Some(server_proto::MvccLogicalLogMetadataProto {
+                format: "lml3".to_string(),
+                checkpoint_transition: false,
+                ranges: vec![server_proto::MvccLogicalLogRangeProto {
+                    generation: 1,
+                    start_offset: range_start,
+                    end_offset: range_end,
+                    starts_with_header: false,
+                    crc_seed: Some(crc_seed.to_le_bytes().to_vec()),
+                }],
+            }),
+        };
+        let mut body = recovery_frame;
+        body.extend_from_slice(&portable_frame);
+
+        assert_eq!(
+            decode_raw_mvcc_log_for_test(header, body).unwrap(),
+            vec![txn]
+        );
+    }
+
+    #[test]
+    fn raw_mvcc_log_decoder_rejects_recovery_ops_without_portable_extension() {
+        let crc_seed = crc32c::crc32c(&1234u64.to_le_bytes());
+        let (raw_frame, _) =
+            raw_mvcc_recovery_frame_without_portable_extension_with_crc(77, crc_seed);
+        let range_start = MVCC_LOG_HEADER_SIZE as u64;
+        let range_end = range_start + raw_frame.len() as u64;
+        let header = PullUpdatesRespProtoBody {
+            server_revision: format!("g1:o{range_end}"),
+            db_size: 0,
+            raw_encoding: None,
+            zstd_encoding: None,
+            stream_kind: PullUpdatesStreamKind::MvccLogicalLog as i32,
+            apply_mode: PullUpdatesApplyMode::Incremental as i32,
+            mvcc_log: Some(server_proto::MvccLogicalLogMetadataProto {
+                format: "lml3".to_string(),
+                checkpoint_transition: false,
+                ranges: vec![server_proto::MvccLogicalLogRangeProto {
+                    generation: 1,
+                    start_offset: range_start,
+                    end_offset: range_end,
+                    starts_with_header: false,
+                    crc_seed: Some(crc_seed.to_le_bytes().to_vec()),
+                }],
+            }),
+        };
+
+        let err = decode_raw_mvcc_log_for_test(header, raw_frame).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("has 1 recovery ops but no portable logical-change extension"),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn raw_mvcc_log_decoder_reencodes_portable_payload_to_scratch_format() {
+        let txn = LogicalTxnData {
+            end_offset: 104,
+            commit_ts: 77,
+            origin_client_id: String::new(),
+            ops: vec![schema_op(
+                LogicalSchemaAction::Create,
+                LogicalSchemaKind::Table,
+                "t",
+                Some("CREATE TABLE t(x INTEGER PRIMARY KEY, y TEXT)"),
+            )],
+        };
+        let portable_payload = txn.encode_length_delimited_to_vec();
+        let crc_seed = crc32c::crc32c(&1234u64.to_le_bytes());
+        let (raw_frame, _) = raw_mvcc_log_frame_with_crc(77, &portable_payload, crc_seed);
+        let range_start = MVCC_LOG_HEADER_SIZE as u64;
+        let range_end = range_start + raw_frame.len() as u64;
+        let header = PullUpdatesRespProtoBody {
+            server_revision: format!("g1:o{range_end}"),
+            db_size: 0,
+            raw_encoding: None,
+            zstd_encoding: None,
+            stream_kind: PullUpdatesStreamKind::MvccLogicalLog as i32,
+            apply_mode: PullUpdatesApplyMode::Incremental as i32,
+            mvcc_log: Some(server_proto::MvccLogicalLogMetadataProto {
+                format: "lml3".to_string(),
+                checkpoint_transition: false,
+                ranges: vec![server_proto::MvccLogicalLogRangeProto {
+                    generation: 1,
+                    start_offset: range_start,
+                    end_offset: range_end,
+                    starts_with_header: false,
+                    crc_seed: Some(crc_seed.to_le_bytes().to_vec()),
+                }],
+            }),
+        };
+
+        assert_eq!(
+            decode_raw_mvcc_log_for_test(header, raw_frame).unwrap(),
+            vec![txn]
         );
     }
 
