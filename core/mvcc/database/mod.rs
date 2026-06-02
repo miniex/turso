@@ -70,8 +70,8 @@ use super::persistent_storage::logical_log::{
 };
 #[cfg(feature = "conn_raw_api")]
 use super::portable_logical::{
-    is_portable_logical_name, is_portable_table_schema_row, portable_schema_row_from_record,
-    PortableLogicalBuilder, PortableObjectMapEntry,
+    is_portable_logical_name, is_portable_schema_row, is_portable_table_schema_row,
+    portable_schema_row_from_record, PortableLogicalBuilder, PortableObjectMapEntry,
 };
 
 #[cfg(test)]
@@ -455,6 +455,10 @@ pub struct LogRecord {
     /// frames, even if this transaction has no client-visible metadata.
     #[cfg(feature = "conn_raw_api")]
     pub portable_changes_enabled: bool,
+    /// True when a frame must carry a portable transaction wrapper even if
+    /// the wrapper metadata itself is empty.
+    #[cfg(feature = "conn_raw_api")]
+    pub portable_changes_required: bool,
 }
 
 impl LogRecord {
@@ -474,6 +478,8 @@ impl LogRecord {
             portable_changes: Vec::new(),
             #[cfg(feature = "conn_raw_api")]
             portable_changes_enabled: false,
+            #[cfg(feature = "conn_raw_api")]
+            portable_changes_required: false,
         }
     }
 
@@ -2284,6 +2290,7 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
             let mut schema_deletes = HashMap::default();
             let mut schema_rowids = Vec::new();
             let mut data_table_ids = HashSet::default();
+            let mut has_portable_schema_changes = false;
             for op in &parsed_ops {
                 match op {
                     ParsedOp::UpsertTable {
@@ -2294,6 +2301,7 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
                     } if *table_id == SQLITE_SCHEMA_MVCC_TABLE_ID => {
                         let rowid = rowid.row_id.to_int_or_panic();
                         let row = portable_schema_row_from_record(record_bytes)?;
+                        has_portable_schema_changes |= is_portable_schema_row(&row);
                         schema_rowids.push(rowid);
                         schema_upserts.insert(rowid, row);
                     }
@@ -2309,6 +2317,7 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
                         }
                         let schema_rowid = rowid.row_id.to_int_or_panic();
                         let row = portable_schema_row_from_record(record_bytes)?;
+                        has_portable_schema_changes |= is_portable_schema_row(&row);
                         schema_rowids.push(schema_rowid);
                         schema_deletes.insert(schema_rowid, row);
                     }
@@ -2467,8 +2476,8 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
 
             for table_id in data_table_ids {
                 let Some(table_ref) = table_refs_by_id.get(&table_id) else {
-                    return Err(LimboError::InternalError(format!(
-                        "unable to resolve MVCC table id for portable changes: table_id={table_id}"
+                    return Err(LimboError::Corrupt(format!(
+                        "portable changes cannot resolve user data table id {table_id}"
                     )));
                 };
                 if !is_portable_logical_name(&table_ref.name) {
@@ -2477,6 +2486,7 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
             }
 
             log_record.portable_changes = builder.finish();
+            log_record.portable_changes_required = has_portable_schema_changes;
             Ok(())
         }
     }

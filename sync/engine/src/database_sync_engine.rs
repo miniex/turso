@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc, Mutex, RwLock,
@@ -15,7 +15,8 @@ use crate::{
     database_sync_engine_io::SyncEngineIo,
     database_sync_lazy_storage::LazyDatabaseStorage,
     database_sync_operations::{
-        acquire_slot, apply_logical_transactions_file_without_commit_with_table_map,
+        acquire_slot,
+        apply_logical_transactions_file_without_commit_excluding_client_txns_with_table_map_and_stats,
         apply_transformation, bootstrap_db_file, connect_untracked, count_local_changes, has_table,
         is_logically_replayable_table, max_local_change_id, pull_updates_v1, push_logical_changes,
         read_last_change_id, read_logical_replay_table_map, read_wal_salt, reset_wal_file,
@@ -33,8 +34,8 @@ use crate::{
     types::{
         Coro, DatabaseMetadata, DatabasePullRevision, DatabaseRowTransformResult,
         DatabaseSavedConfiguration, DatabaseSyncEngineProtocolVersion, DatabaseTapeOperation,
-        DatabaseTapeRowChange, DbChangesStatus, DbChangesStreamKind, PartialSyncOpts,
-        SyncEngineIoResult, SyncEngineStats, DATABASE_METADATA_VERSION,
+        DatabaseTapeRowChange, DatabaseTapeRowChangeType, DbChangesStatus, DbChangesStreamKind,
+        PartialSyncOpts, SyncEngineIoResult, SyncEngineStats, DATABASE_METADATA_VERSION,
     },
     wal_session::WalSession,
     Result,
@@ -451,17 +452,28 @@ fn logical_mvcc_pull_disable_reason(
 /// transactions are filtered separately by client metadata.
 fn resolve_local_replay_floor_change_id(
     use_pushed_change_hint: bool,
+    use_pushed_replay_floor_hint: bool,
     local_pull_gen: i64,
     remote_pull_gen: i64,
     remote_last_change_id: Option<i64>,
     last_pushed_pull_gen_hint: i64,
     last_pushed_change_id_hint: i64,
+    last_pushed_replay_floor_change_id_hint: i64,
 ) -> Option<i64> {
     let mut last_change_id = if remote_pull_gen == local_pull_gen {
         remote_last_change_id
     } else {
         Some(0)
     };
+
+    if use_pushed_replay_floor_hint
+        && last_pushed_pull_gen_hint == local_pull_gen
+        && last_pushed_change_id_hint > 0
+        && last_change_id == Some(last_pushed_change_id_hint)
+        && last_pushed_replay_floor_change_id_hint < last_pushed_change_id_hint
+    {
+        last_change_id = Some(last_pushed_replay_floor_change_id_hint);
+    }
 
     if use_pushed_change_hint
         && last_pushed_pull_gen_hint == local_pull_gen
@@ -472,6 +484,14 @@ fn resolve_local_replay_floor_change_id(
     }
 
     last_change_id
+}
+
+fn use_pushed_change_hint_for_local_replay(stream_kind: DbChangesStreamKind) -> bool {
+    !matches!(stream_kind, DbChangesStreamKind::Logical)
+}
+
+fn use_pushed_replay_floor_hint_for_local_replay(stream_kind: DbChangesStreamKind) -> bool {
+    matches!(stream_kind, DbChangesStreamKind::Logical)
 }
 
 /// Enables expensive integrity diagnostics for remote apply debugging.
@@ -516,6 +536,38 @@ async fn debug_integrity_check<Ctx>(
     Ok(())
 }
 
+fn quote_sync_ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+async fn rowid_exists_after_remote_apply<Ctx>(
+    coro: &Coro<Ctx>,
+    conn: &Arc<turso_core::Connection>,
+    change: &DatabaseTapeRowChange,
+) -> Result<bool> {
+    if !is_logically_replayable_table(&change.table_name) {
+        return Ok(false);
+    }
+
+    let sql = format!(
+        "SELECT 1 FROM {} WHERE rowid = ? LIMIT 1",
+        quote_sync_ident(&change.table_name)
+    );
+    let mut stmt = match conn.prepare(sql) {
+        Ok(stmt) => stmt,
+        Err(error) => {
+            tracing::debug!(
+                "rowid_exists_after_remote_apply: unable to prepare row lookup for table={} rowid={}: {error}",
+                change.table_name,
+                change.id
+            );
+            return Ok(false);
+        }
+    };
+    stmt.bind_at(1.try_into().unwrap(), Value::from_i64(change.id))?;
+    Ok(run_stmt_once(coro, &mut stmt).await?.is_some())
+}
+
 /// Logs local CDC replay shape for remote-apply diagnostics.
 fn log_local_change_summary(
     path: &str,
@@ -530,11 +582,27 @@ fn log_local_change_summary(
     for change in changes {
         *by_table.entry(change.table_name.as_str()).or_default() += 1;
     }
+    let preview = changes
+        .iter()
+        .take(32)
+        .map(|change| {
+            let kind = match &change.change {
+                crate::types::DatabaseTapeRowChangeType::Insert { .. } => "insert",
+                crate::types::DatabaseTapeRowChangeType::Update { .. } => "update",
+                crate::types::DatabaseTapeRowChangeType::Delete { .. } => "delete",
+            };
+            format!(
+                "{}:{}:{}:{}",
+                change.change_id, change.table_name, change.id, kind
+            )
+        })
+        .collect::<Vec<_>>();
     tracing::warn!(
-        "apply_changes(path={}): {} local row changes by table: {:?}",
+        "apply_changes(path={}): {} local row changes by table: {:?}; preview={:?}",
         path,
         label,
-        by_table
+        by_table,
+        preview
     );
 }
 
@@ -978,6 +1046,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                     revert_since_wal_watermark: 0,
                     last_pushed_change_id_hint: 0,
                     last_pushed_pull_gen_hint: 0,
+                    last_pushed_replay_floor_change_id_hint: 0,
                     last_pull_unix_time: Some(io.current_time_wall_clock().secs),
                     last_push_unix_time: None,
                     partial_bootstrap_server_revision: if partial {
@@ -1022,6 +1091,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                     revert_since_wal_watermark: 0,
                     last_pushed_change_id_hint: 0,
                     last_pushed_pull_gen_hint: 0,
+                    last_pushed_replay_floor_change_id_hint: 0,
                     last_pull_unix_time: None,
                     last_push_unix_time: None,
                     partial_bootstrap_server_revision: None,
@@ -1909,6 +1979,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             m.synced_revision = Some(new_revision.clone());
             m.last_pushed_pull_gen_hint = 0;
             m.last_pushed_change_id_hint = 0;
+            m.last_pushed_replay_floor_change_id_hint = 0;
             m.last_pull_unix_time = Some(remote_changes.time.secs);
             m.logical_table_names_by_stable_id = logical_table_names_by_stable_id;
         })
@@ -1976,11 +2047,16 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             local_last_change_id,
             replace_base_pages,
         );
-        let (last_pushed_pull_gen_hint, last_pushed_change_id_hint) = {
+        let (
+            last_pushed_pull_gen_hint,
+            last_pushed_change_id_hint,
+            last_pushed_replay_floor_change_id_hint,
+        ) = {
             let meta = self.meta();
             (
                 meta.last_pushed_pull_gen_hint,
                 meta.last_pushed_change_id_hint,
+                meta.last_pushed_replay_floor_change_id_hint,
             )
         };
         let precollect_local_changes_before_remote_apply = replace_base_pages
@@ -1998,11 +2074,13 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             // replace-base snapshot that already contains it.
             resolve_local_replay_floor_change_id(
                 true,
+                false,
                 local_pull_gen,
                 local_pull_gen,
                 local_last_change_id,
                 last_pushed_pull_gen_hint,
                 last_pushed_change_id_hint,
+                last_pushed_replay_floor_change_id_hint,
             )
         } else {
             None
@@ -2107,6 +2185,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
 
             // Phase 2: after revert DB has no local changes in its latest state - so its safe to apply changes from remote
             let mut logical_replay_conn = None;
+            let mut remote_touched_rows = BTreeSet::new();
             let mut applied_raw_db_size = 0;
             match stream_kind {
             stream_kind if stream_kind_applies_remote_pages(stream_kind) => {
@@ -2298,10 +2377,12 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                         summary
                     );
                 }
-                apply_logical_transactions_file_without_commit_with_table_map(
+                let replay_stats =
+                    apply_logical_transactions_file_without_commit_excluding_client_txns_with_table_map_and_stats(
                     coro,
                     &mut replay,
                     changes_file,
+                    &self.client_unique_id,
                     &mut logical_table_names_by_stable_id,
                 )
                 .await
@@ -2310,9 +2391,11 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                         "failed to apply remote logical transactions: {error}",
                     ))
                 })?;
+                remote_touched_rows = replay_stats.touched_rows;
                 tracing::info!(
-                    "apply_changes(path={}): applied logical transactions from remote file",
+                    "apply_changes(path={}): applied logical transactions from remote file; touched_rows={}",
                     self.main_db_path,
+                    remote_touched_rows.len(),
                 );
                 logical_replay_conn = Some(conn);
             }
@@ -2392,11 +2475,15 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             ))
         })?;
         // Pull apply rolls back the local WAL while installing remote changes,
-        // so pending local CDC must be replayed locally afterward. Changes that
-        // were already acknowledged by a successful push are present in the
-        // remote stream/snapshot and must not be replayed from an older local
-        // row image.
-        let use_pushed_change_hint = true;
+        // so pending local CDC must be replayed locally afterward. Page and
+        // replace-base transports include this client's pushed writes in the
+        // installed remote image, so the push hint can suppress duplicate
+        // replay. Logical pulls filter self-originated transactions from the
+        // remote stream; using the push hint there would skip the local replay
+        // of those filtered writes.
+        let use_pushed_change_hint = use_pushed_change_hint_for_local_replay(stream_kind);
+        let use_pushed_replay_floor_hint =
+            use_pushed_replay_floor_hint_for_local_replay(stream_kind);
 
         // Phase 4: as now DB has all data from remote - let's read pull generation and last change id for current client
         // we will use last_change_id in order to replay local changes made strictly after that id locally
@@ -2427,21 +2514,25 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         }
         let last_change_id = resolve_local_replay_floor_change_id(
             use_pushed_change_hint,
+            use_pushed_replay_floor_hint,
             local_pull_gen,
             remote_pull_gen,
             remote_last_change_id,
             last_pushed_pull_gen_hint,
             last_pushed_change_id_hint,
+            last_pushed_replay_floor_change_id_hint,
         );
         tracing::info!(
-            "apply_changes(path={}): local replay floor: use_pushed_change_hint={} local_pull_gen={} remote_pull_gen={} remote_last_change_id={:?} last_pushed_pull_gen_hint={} last_pushed_change_id_hint={} resolved_last_change_id={:?}",
+            "apply_changes(path={}): local replay floor: use_pushed_change_hint={} use_pushed_replay_floor_hint={} local_pull_gen={} remote_pull_gen={} remote_last_change_id={:?} last_pushed_pull_gen_hint={} last_pushed_change_id_hint={} last_pushed_replay_floor_change_id_hint={} resolved_last_change_id={:?}",
             self.main_db_path,
             use_pushed_change_hint,
+            use_pushed_replay_floor_hint,
             local_pull_gen,
             remote_pull_gen,
             remote_last_change_id,
             last_pushed_pull_gen_hint,
             last_pushed_change_id_hint,
+            last_pushed_replay_floor_change_id_hint,
             last_change_id,
         );
         // Phase 5: collect/filter local changes for replay.
@@ -2472,6 +2563,59 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                     }
                 }
             }
+            local_changes
+        };
+        let replaying_pushed_self_range = use_pushed_replay_floor_hint
+            && last_pushed_change_id_hint > 0
+            && last_pushed_replay_floor_change_id_hint < last_pushed_change_id_hint
+            && replay_floor == last_pushed_replay_floor_change_id_hint;
+        let local_changes = if replaying_pushed_self_range && !remote_touched_rows.is_empty() {
+            let mut filtered = Vec::with_capacity(local_changes.len());
+            let mut skipped = 0usize;
+            for change in local_changes {
+                let pushed_self_upsert = change.change_id <= last_pushed_change_id_hint
+                    && !matches!(change.change, DatabaseTapeRowChangeType::Delete { .. });
+                let row_key = (change.table_name.clone(), change.id);
+                if pushed_self_upsert && remote_touched_rows.contains(&row_key) {
+                    skipped += 1;
+                    continue;
+                }
+                filtered.push(change);
+            }
+            if skipped > 0 {
+                tracing::info!(
+                    "apply_changes(path={}): skipped {} pushed local changes covered by remote logical row ops",
+                    self.main_db_path,
+                    skipped,
+                );
+            }
+            filtered
+        } else {
+            local_changes
+        };
+        let local_changes = if replaying_pushed_self_range {
+            let mut filtered = Vec::with_capacity(local_changes.len());
+            let mut skipped = 0usize;
+            for change in local_changes {
+                let pushed_self_insert = change.change_id <= last_pushed_change_id_hint
+                    && matches!(change.change, DatabaseTapeRowChangeType::Insert { .. });
+                if pushed_self_insert
+                    && rowid_exists_after_remote_apply(coro, phase_conn, &change).await?
+                {
+                    skipped += 1;
+                    continue;
+                }
+                filtered.push(change);
+            }
+            if skipped > 0 {
+                tracing::info!(
+                    "apply_changes(path={}): skipped {} pushed local inserts already present after remote apply",
+                    self.main_db_path,
+                    skipped,
+                );
+            }
+            filtered
+        } else {
             local_changes
         };
         let replayed_local_changes = !local_changes.is_empty();
@@ -2790,7 +2934,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             self.meta().remote_url(),
             self.opts.remote_encryption_key.as_deref(),
         );
-        let (pull_gen, change_id) =
+        let (pull_gen, replay_floor_change_id, change_id) =
             push_logical_changes(ctx, &self.main_tape, &self.client_unique_id, &self.opts).await?;
         let main_conn = connect_untracked(&self.main_tape)?;
         update_last_change_id(
@@ -2808,8 +2952,11 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         })?;
 
         self.update_meta(coro, |m| {
-            m.last_pushed_pull_gen_hint = pull_gen;
-            m.last_pushed_change_id_hint = change_id;
+            if change_id > replay_floor_change_id {
+                m.last_pushed_pull_gen_hint = pull_gen;
+                m.last_pushed_change_id_hint = change_id;
+                m.last_pushed_replay_floor_change_id_hint = replay_floor_change_id;
+            }
             m.last_push_unix_time = Some(self.io.current_time_wall_clock().secs);
         })
         .await?;
@@ -2915,9 +3062,10 @@ mod tests {
     use super::{
         create_meta_path, create_replace_base_marker_path, logical_mvcc_pull_disable_reason,
         resolve_local_replay_floor_change_id, should_replay_raw_pages_on_sql_conn,
-        should_use_logical_mvcc_pull, stream_kind_applies_remote_pages, DatabaseSyncEngine,
-        DatabaseSyncEngineOpts, REPLACE_BASE_LOCAL_REPLAY_FAILURE_AFTER, WAL_FRAME_HEADER,
-        WAL_FRAME_SIZE,
+        should_use_logical_mvcc_pull, stream_kind_applies_remote_pages,
+        use_pushed_change_hint_for_local_replay, use_pushed_replay_floor_hint_for_local_replay,
+        DatabaseSyncEngine, DatabaseSyncEngineOpts, REPLACE_BASE_LOCAL_REPLAY_FAILURE_AFTER,
+        WAL_FRAME_HEADER, WAL_FRAME_SIZE,
     };
     use crate::{
         database_sync_engine_io::{DataCompletion, DataPollResult, SyncEngineIo},
@@ -3159,32 +3307,56 @@ mod tests {
     }
 
     #[test]
-    fn logical_replay_uses_last_pushed_hint_when_sync_row_is_stale() {
-        let floor = resolve_local_replay_floor_change_id(true, 7, 7, Some(12), 7, 34);
-        assert_eq!(floor, Some(34));
+    fn logical_replay_does_not_use_last_pushed_hint_when_sync_row_is_stale() {
+        let floor = resolve_local_replay_floor_change_id(false, true, 7, 7, Some(12), 7, 34, 12);
+        assert_eq!(floor, Some(12));
+        assert!(!use_pushed_change_hint_for_local_replay(
+            DbChangesStreamKind::Logical
+        ));
+        assert!(use_pushed_replay_floor_hint_for_local_replay(
+            DbChangesStreamKind::Logical
+        ));
     }
 
     #[test]
-    fn replace_base_precollection_uses_last_pushed_hint_when_sync_row_is_stale() {
-        let floor = resolve_local_replay_floor_change_id(true, 7, 7, Some(12), 7, 34);
-        assert_eq!(floor, Some(34));
-    }
-
-    #[test]
-    fn logical_replay_ignores_last_pushed_hint_from_stale_pull_generation() {
-        let floor = resolve_local_replay_floor_change_id(true, 7, 7, Some(12), 6, 34);
+    fn logical_replay_uses_pre_push_floor_when_remote_sync_row_matches_last_push() {
+        let floor = resolve_local_replay_floor_change_id(false, true, 7, 7, Some(34), 7, 34, 12);
         assert_eq!(floor, Some(12));
     }
 
     #[test]
-    fn logical_replay_uses_last_pushed_hint_when_remote_pull_generation_rolls_back() {
-        let floor = resolve_local_replay_floor_change_id(true, 7, 6, Some(12), 7, 34);
+    fn page_replay_uses_last_pushed_hint_when_sync_row_is_stale() {
+        let floor = resolve_local_replay_floor_change_id(true, false, 7, 7, Some(12), 7, 34, 12);
+        assert_eq!(floor, Some(34));
+        assert!(use_pushed_change_hint_for_local_replay(
+            DbChangesStreamKind::Pages
+        ));
+        assert!(!use_pushed_replay_floor_hint_for_local_replay(
+            DbChangesStreamKind::Pages
+        ));
+    }
+
+    #[test]
+    fn replace_base_precollection_uses_last_pushed_hint_when_sync_row_is_stale() {
+        let floor = resolve_local_replay_floor_change_id(true, false, 7, 7, Some(12), 7, 34, 12);
+        assert_eq!(floor, Some(34));
+    }
+
+    #[test]
+    fn local_replay_ignores_last_pushed_hint_from_stale_pull_generation() {
+        let floor = resolve_local_replay_floor_change_id(true, false, 7, 7, Some(12), 6, 34, 12);
+        assert_eq!(floor, Some(12));
+    }
+
+    #[test]
+    fn page_replay_uses_last_pushed_hint_when_remote_pull_generation_rolls_back() {
+        let floor = resolve_local_replay_floor_change_id(true, false, 7, 6, Some(12), 7, 34, 12);
         assert_eq!(floor, Some(34));
     }
 
     #[test]
     fn raw_wal_replay_does_not_override_remote_overlap_with_push_hint() {
-        let floor = resolve_local_replay_floor_change_id(false, 7, 7, Some(12), 7, 34);
+        let floor = resolve_local_replay_floor_change_id(false, false, 7, 7, Some(12), 7, 34, 12);
         assert_eq!(floor, Some(12));
     }
 
@@ -3268,6 +3440,7 @@ mod tests {
             last_push_unix_time: None,
             last_pushed_pull_gen_hint: 0,
             last_pushed_change_id_hint: 0,
+            last_pushed_replay_floor_change_id_hint: 0,
             partial_bootstrap_server_revision: Some(DatabasePullRevision::V1 {
                 revision: "g1:o10".to_string(),
             }),
@@ -3350,6 +3523,7 @@ mod tests {
             last_push_unix_time: None,
             last_pushed_pull_gen_hint: 0,
             last_pushed_change_id_hint: 0,
+            last_pushed_replay_floor_change_id_hint: 0,
             partial_bootstrap_server_revision: None,
             logical_table_names_by_stable_id: Default::default(),
             saved_configuration: Some(DatabaseSavedConfiguration {
@@ -3881,6 +4055,7 @@ mod tests {
                     .update_meta(&coro, |meta| {
                         meta.last_pushed_pull_gen_hint = 0;
                         meta.last_pushed_change_id_hint = 0;
+                        meta.last_pushed_replay_floor_change_id_hint = 0;
                     })
                     .await?;
 

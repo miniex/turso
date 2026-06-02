@@ -565,6 +565,7 @@ impl TursoSyncServer {
             zstd_encoding: None,
             stream_kind: PullUpdatesStreamKind::Pages as i32,
             apply_mode: PullUpdatesApplyMode::Incremental as i32,
+            mvcc_log: None,
         };
 
         let mut response_body = Vec::new();

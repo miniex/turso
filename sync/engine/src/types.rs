@@ -167,6 +167,8 @@ pub struct DatabaseMetadata {
     pub last_push_unix_time: Option<i64>,
     pub last_pushed_pull_gen_hint: i64,
     pub last_pushed_change_id_hint: i64,
+    #[serde(default)]
+    pub last_pushed_replay_floor_change_id_hint: i64,
     pub partial_bootstrap_server_revision: Option<DatabasePullRevision>,
     /// Local identity map for portable MVCC logical replay. Keys are stable
     /// table ids from raw logical-log schema operations; values are the current
@@ -742,5 +744,6 @@ mod tests {
         .unwrap();
 
         assert!(meta.logical_table_names_by_stable_id.is_empty());
+        assert_eq!(meta.last_pushed_replay_floor_change_id_hint, 0);
     }
 }

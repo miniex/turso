@@ -1873,6 +1873,34 @@ fn test_bootstrap_handles_committed_wal_when_log_truncated() {
     assert_eq!(wal_len, 0);
 }
 
+#[cfg(feature = "conn_raw_api")]
+#[test]
+fn test_reload_wal_after_external_restore_preserves_mv_store_on_bootstrap_error() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let db_path = db.path.as_ref().unwrap().clone();
+    let database = db.get_db();
+    let previous_mv_store = database.get_mv_store().clone().unwrap();
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE reload_guard(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO reload_guard VALUES (1, 'before')")
+            .unwrap();
+        conn.close().unwrap();
+    }
+    overwrite_log_header_byte(&db_path, 0, 0x00);
+
+    let err = database
+        .reload_wal_after_external_restore()
+        .expect_err("corrupt logical-log header should make reload bootstrap fail");
+    assert!(matches!(err, LimboError::Corrupt(_)));
+    let current_mv_store = database.get_mv_store().clone().unwrap();
+    assert!(
+        Arc::ptr_eq(&previous_mv_store, &current_mv_store),
+        "failed reload must leave the previously published MV store installed"
+    );
+}
+
 /// What this test checks: WAL frames without a commit marker are treated as non-committed tail and ignored.
 /// Why this matters: Recovery must preserve availability by discarding invalid WAL tail bytes instead of failing startup.
 #[test]
@@ -12285,6 +12313,38 @@ fn test_mvcc_portable_changes_resolve_rows_through_object_map_in_same_txn() {
 
 #[cfg(feature = "conn_raw_api")]
 #[test]
+fn test_mvcc_portable_changes_error_on_unresolved_user_data_table_id() {
+    let db = MvccTestDb::new_with_portable_logical_changes();
+    let unresolved_table_id = MVTableId::from(-99_999_i64);
+    let row_version = RowVersion {
+        id: 1,
+        begin: Some(TxTimestampOrID::Timestamp(10)),
+        end: None,
+        row: generate_simple_string_row(unresolved_table_id, 1, "alpha"),
+        btree_resident: false,
+    };
+    let mut log_record = LogRecord::for_test(10, &[row_version], None);
+    let mut commit_sm = CommitStateMachine::new(
+        CommitState::Initial,
+        1,
+        db.mvcc_store.clone(),
+        db.conn.clone(),
+        crate::MAIN_DB_ID,
+        db.mvcc_store.commit_coordinator.clone(),
+        db.mvcc_store.global_header.clone(),
+        db.conn.get_sync_mode(),
+    );
+
+    let err = commit_sm
+        .populate_portable_changes(&db.mvcc_store, &mut log_record)
+        .expect_err("unresolved user data table id must fail portable metadata generation");
+    commit_sm.is_finalized = true;
+
+    assert!(matches!(err, LimboError::Corrupt(message) if message.contains("MVTableId(-99999)")));
+}
+
+#[cfg(feature = "conn_raw_api")]
+#[test]
 fn test_mvcc_portable_changes_emit_index_drop_for_drop_table() {
     let db = MvccTestDb::new_with_portable_logical_changes();
     db.conn
@@ -12300,6 +12360,29 @@ fn test_mvcc_portable_changes_emit_index_drop_for_drop_table() {
     let objects = decoded_object_maps(&txns);
 
     assert!(objects.iter().any(|object| object.name == "items"));
+    assert!(!bytes_contain(&portable_changes, b"items_payload_idx"));
+}
+
+#[cfg(feature = "conn_raw_api")]
+#[test]
+fn test_mvcc_portable_changes_emit_extension_for_schema_only_create_index() {
+    let db = MvccTestDb::new_with_portable_logical_changes();
+    db.conn
+        .execute("CREATE TABLE items(id INTEGER PRIMARY KEY, portable_changes TEXT)")
+        .unwrap();
+
+    let txns_before = decode_portable_change_txns(&collect_mvcc_portable_change_bytes(&db.conn));
+    db.conn
+        .execute("CREATE INDEX items_payload_idx ON items(portable_changes)")
+        .unwrap();
+
+    let portable_changes = collect_mvcc_portable_change_bytes(&db.conn);
+    let txns_after = decode_portable_change_txns(&portable_changes);
+
+    assert!(
+        txns_after.len() > txns_before.len(),
+        "schema-only CREATE INDEX must emit a portable extension frame"
+    );
     assert!(!bytes_contain(&portable_changes, b"items_payload_idx"));
 }
 

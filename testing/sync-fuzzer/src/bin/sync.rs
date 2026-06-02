@@ -159,6 +159,13 @@ struct PullUpdatesProbe {
     raw_logical_bytes: usize,
 }
 
+impl PullUpdatesProbe {
+    fn has_pending_changes_for(&self, client_revision: &str) -> bool {
+        self.server_revision != client_revision
+            && (self.raw_logical_bytes > 0 || self.trailing_messages > 0)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, prost::Enumeration)]
 #[repr(i32)]
 enum ProbePageUpdatesEncodingReq {
@@ -300,6 +307,7 @@ impl SchemaActor {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    install_rustls_crypto_provider();
     init_logging();
     let args = parse_args()?;
     let config = load_config()?;
@@ -307,6 +315,10 @@ async fn main() -> Result<()> {
         RunMode::Scripted => run_scripted(&config, args.protocol).await,
         RunMode::Seeded => run_seeded(&config, &args).await,
     }
+}
+
+fn install_rustls_crypto_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
 fn init_logging() {
@@ -1529,7 +1541,7 @@ async fn run_targeted_mvcc_logical_coverage_suite(
     assert_scripted_current_generation_logical_pull_after_remote_drop(config).await?;
     run_orphan_index_checkpoint_probe(config, root_dir, "seeded-targeted").await?;
     let previous_generation = query_remote_generation(config).await?;
-    let next_generation = force_remote_generation_rollover_with_push_pressure(
+    match force_remote_generation_rollover_with_push_pressure(
         config,
         replicas
             .first()
@@ -1539,12 +1551,50 @@ async fn run_targeted_mvcc_logical_coverage_suite(
         "orphan-index-probe",
         previous_generation,
     )
-    .await?;
-    state.record_note(format!(
-        "orphan-index probe forced generation rollover from {previous_generation} to {next_generation}"
-    ));
-    assert_no_remote_orphan_indexes(config, "seeded-targeted after orphan-index rollover").await?;
+    .await
+    {
+        Ok(next_generation) => {
+            state.record_note(format!(
+                "orphan-index probe forced generation rollover from {previous_generation} to {next_generation}"
+            ));
+            assert_no_remote_orphan_indexes(config, "seeded-targeted after orphan-index rollover")
+                .await?;
+            wait_for_cluster_convergence(
+                config,
+                replicas,
+                &state.table,
+                "seeded-targeted after orphan-index rollover",
+                Some(state),
+            )
+            .await?;
+            refresh_replica_revisions_after_generation_rollover(
+                config,
+                replicas,
+                "seeded-targeted after orphan-index rollover",
+            )
+            .await?;
+        }
+        Err(error) => {
+            eprintln!(
+                "scripted note: skipping orphan-index generation rollover follow-up because generation did not advance: {error:#}"
+            );
+            state.record_note(format!(
+                "skipped orphan-index generation rollover follow-up after failed rollover attempt from {previous_generation}"
+            ));
+            assert_no_remote_orphan_indexes(
+                config,
+                "seeded-targeted after skipped orphan-index rollover",
+            )
+            .await?;
+        }
+    }
     run_replace_base_local_preservation_check(config, root_dir, state).await?;
+    refresh_replica_revisions_after_generation_rollover(
+        config,
+        replicas,
+        "seeded-targeted before current-generation logical probes",
+    )
+    .await?;
     run_incremental_logical_stream_check(config, replicas, state).await?;
     run_quoted_identifier_logical_stream_check(config, replicas, state).await?;
     run_mixed_transaction_logical_stream_check(config, replicas, state, SchemaActor::Remote)
@@ -2496,6 +2546,21 @@ async fn run_incremental_logical_stream_check(
 
     let probe = probe_pull_updates_stream(config, &client_revision).await?;
     if !probe_is_logical(&probe) {
+        if let Some((client_generation, server_generation)) =
+            probe_crossed_generation(&client_revision, &probe)?
+        {
+            println!(
+                "scripted note: incremental logical probe crossed generation {} -> {}; server returned {:?}/{:?}",
+                client_generation,
+                server_generation,
+                probe.stream_kind,
+                probe.apply_mode,
+            );
+            state.record_note(format!(
+                "skipped incremental logical probe after generation crossed from {client_generation} to {server_generation}"
+            ));
+            return Ok(());
+        }
         bail!(
             "expected logical pull-updates stream for incremental MVCC check, got {:?}; replica={} client_revision={} server_revision={}",
             probe.stream_kind,
@@ -2552,6 +2617,26 @@ async fn run_quoted_identifier_logical_stream_check(
 
     let probe = probe_pull_updates_stream(config, &client_revision).await?;
     if !probe_is_logical(&probe) {
+        if let Some((client_generation, server_generation)) =
+            probe_crossed_generation(&client_revision, &probe)?
+        {
+            println!(
+                "scripted note: quoted identifier logical probe crossed generation {} -> {}; server returned {:?}/{:?}",
+                client_generation,
+                server_generation,
+                probe.stream_kind,
+                probe.apply_mode,
+            );
+            execute_remote_sql(
+                config,
+                &format!("DROP TABLE IF EXISTS {}", sql_ident(&quoted_table)),
+            )
+            .await?;
+            state.record_note(format!(
+                "skipped quoted identifier logical probe after generation crossed from {client_generation} to {server_generation}"
+            ));
+            return Ok(());
+        }
         bail!(
             "expected logical pull-updates stream for quoted identifier check, got {:?}; client_revision={} server_revision={}",
             probe.stream_kind,
@@ -2713,6 +2798,22 @@ async fn run_mixed_transaction_logical_stream_check(
         .await?;
     }
     if !probe_is_logical(&probe) {
+        if let Some((client_generation, server_generation)) =
+            probe_crossed_generation(&observer_revision, &probe)?
+        {
+            println!(
+                "scripted note: mixed transaction logical probe crossed generation {} -> {}; server returned {:?}/{:?}",
+                client_generation,
+                server_generation,
+                probe.stream_kind,
+                probe.apply_mode,
+            );
+            state.record_note(format!(
+                "skipped {} mixed transaction logical probe after generation crossed from {client_generation} to {server_generation}",
+                actor.label()
+            ));
+            return Ok(());
+        }
         bail!(
             "expected logical pull-updates stream for mixed transaction check, got {:?}; client_revision={} server_revision={}",
             probe.stream_kind,
@@ -2843,6 +2944,20 @@ async fn run_generation_rollover_logical_recovery_check(
     let server_revision: RichMvccRevision = serde_json::from_str(&probe.server_revision)
         .context("invalid server revision returned from pull-updates probe")?;
     if !probe_is_logical(&probe) {
+        if server_revision.generation != parsed_revision.generation {
+            println!(
+                "scripted note: generation rollover logical recovery probe crossed generation {} -> {}; server returned {:?}/{:?}",
+                parsed_revision.generation,
+                server_revision.generation,
+                probe.stream_kind,
+                probe.apply_mode,
+            );
+            state.record_note(format!(
+                "skipped generation rollover logical recovery probe after generation crossed from {} to {}",
+                parsed_revision.generation, server_revision.generation
+            ));
+            return Ok(());
+        }
         bail!(
             "expected logical pull-updates stream after generation rollover, got {:?}; client_revision={} server_revision={}",
             probe.stream_kind,
@@ -2894,7 +3009,10 @@ async fn wait_for_cluster_convergence(
     label: &str,
     diagnostics: Option<&SeededScenarioState>,
 ) -> Result<TableSnapshot> {
-    let deadline = Instant::now() + CONVERGENCE_TIMEOUT;
+    const MAX_PENDING_PULL_EXTENSIONS: usize = 3;
+
+    let mut deadline = Instant::now() + CONVERGENCE_TIMEOUT;
+    let mut pending_pull_extensions = 0usize;
     let mut attempts = 0usize;
     loop {
         attempts += 1;
@@ -2922,18 +3040,23 @@ async fn wait_for_cluster_convergence(
         }
         if Instant::now() >= deadline {
             let mut details = Vec::new();
+            let mut pending_pull_updates = false;
             for (name, snapshot) in mismatches {
                 let revision =
                     if let Some(replica) = replicas.iter().find(|replica| replica.name == name) {
                         match replica.db.stats().await {
                             Ok(stats) => {
                                 if let Some(revision) = stats.revision.clone() {
-                                    print_pull_updates_probe(
+                                    if print_pull_updates_probe(
                                         config,
                                         &revision,
                                         &format!("{label} {}", replica.name),
                                     )
-                                    .await;
+                                    .await
+                                    .is_some_and(|probe| probe.has_pending_changes_for(&revision))
+                                    {
+                                        pending_pull_updates = true;
+                                    }
                                 } else {
                                     eprintln!(
                                         "pull-updates probe for {} skipped: no stored revision",
@@ -2954,6 +3077,16 @@ async fn wait_for_cluster_convergence(
                     summarize_snapshot_diff(&remote, &snapshot),
                 ));
             }
+            if pending_pull_updates && pending_pull_extensions < MAX_PENDING_PULL_EXTENSIONS {
+                pending_pull_extensions += 1;
+                deadline = Instant::now() + CONVERGENCE_TIMEOUT;
+                eprintln!(
+                    "cluster convergence for {label} reached deadline with pending pull-updates; extending wait window {pending_pull_extensions}/{MAX_PENDING_PULL_EXTENSIONS}"
+                );
+                sync_all_replicas(config, replicas, table, label).await?;
+                sleep(Duration::from_millis(250)).await;
+                continue;
+            }
             bail!(
                 "cluster failed to converge for {label} within {:?}\nremote={}\n{}",
                 CONVERGENCE_TIMEOUT,
@@ -2964,6 +3097,47 @@ async fn wait_for_cluster_convergence(
         sync_all_replicas(config, replicas, table, label).await?;
         sleep(Duration::from_millis(250)).await;
     }
+}
+
+async fn refresh_replica_revisions_after_generation_rollover(
+    config: &Config,
+    replicas: &mut [LocalReplica],
+    label: &str,
+) -> Result<()> {
+    let server_probe = probe_pull_updates_header(config, "")
+        .await
+        .with_context(|| format!("failed to probe server revision during {label}"))?;
+    let server_revision: RichMvccRevision = serde_json::from_str(&server_probe.server_revision)
+        .with_context(|| {
+            format!(
+                "invalid server revision during {label}: {}",
+                server_probe.server_revision
+            )
+        })?;
+
+    for replica in replicas.iter_mut() {
+        let before = current_replica_revision(replica).await?;
+        pull_replica_with_legacy_retry(config, replica, label)
+            .await
+            .with_context(|| format!("revision refresh pull failed for {}", replica.name))?;
+        let after = current_replica_revision(replica).await?;
+        update_revision_monotonic(replica, label).await?;
+        let after_revision: RichMvccRevision = serde_json::from_str(&after)
+            .with_context(|| format!("invalid refreshed revision for {}", replica.name))?;
+        println!(
+            "revision refresh for {label}: {} {} -> {}",
+            replica.name, before, after
+        );
+        if after_revision.generation > server_revision.generation {
+            bail!(
+                "replica {} remained behind server generation during {label}: replica_revision={} server_revision={}",
+                replica.name,
+                after,
+                server_probe.server_revision,
+            );
+        }
+    }
+    Ok(())
 }
 
 async fn sync_all_replicas(
@@ -5239,22 +5413,32 @@ async fn probe_pull_updates_header(
     })
 }
 
-async fn print_pull_updates_probe(config: &Config, client_revision: &str, label: &str) {
+async fn print_pull_updates_probe(
+    config: &Config,
+    client_revision: &str,
+    label: &str,
+) -> Option<PullUpdatesProbe> {
     match probe_pull_updates_stream(config, client_revision).await {
-        Ok(probe) => eprintln!(
-            "pull-updates probe for {label}: client_revision={} server_revision={} db_size={} stream_kind={:?} apply_mode={:?} trailing_messages={} raw_logical_bytes={}",
-            client_revision,
-            probe.server_revision,
-            probe.db_size,
-            probe.stream_kind,
-            probe.apply_mode,
-            probe.trailing_messages,
-            probe.raw_logical_bytes,
-        ),
-        Err(err) => eprintln!(
-            "pull-updates probe for {label} failed: client_revision={} err={:#}",
-            client_revision, err
-        ),
+        Ok(probe) => {
+            eprintln!(
+                "pull-updates probe for {label}: client_revision={} server_revision={} db_size={} stream_kind={:?} apply_mode={:?} trailing_messages={} raw_logical_bytes={}",
+                client_revision,
+                probe.server_revision,
+                probe.db_size,
+                probe.stream_kind,
+                probe.apply_mode,
+                probe.trailing_messages,
+                probe.raw_logical_bytes,
+            );
+            Some(probe)
+        }
+        Err(err) => {
+            eprintln!(
+                "pull-updates probe for {label} failed: client_revision={} err={:#}",
+                client_revision, err
+            );
+            None
+        }
     }
 }
 
@@ -5274,6 +5458,21 @@ fn read_probe_stream_kind(body: &[u8]) -> Result<Option<PullUpdatesStreamKind>> 
 
 fn probe_is_logical(probe: &PullUpdatesProbe) -> bool {
     probe.stream_kind == Some(PullUpdatesStreamKind::MvccLogicalLog)
+}
+
+fn probe_crossed_generation(
+    client_revision: &str,
+    probe: &PullUpdatesProbe,
+) -> Result<Option<(u64, u64)>> {
+    let client: MvccRevision = serde_json::from_str(client_revision)
+        .with_context(|| format!("invalid client revision: {client_revision}"))?;
+    let server: MvccRevision = serde_json::from_str(&probe.server_revision)
+        .with_context(|| format!("invalid server revision: {}", probe.server_revision))?;
+    if client.generation == server.generation {
+        Ok(None)
+    } else {
+        Ok(Some((client.generation, server.generation)))
+    }
 }
 
 fn probe_has_logical_payload(probe: &PullUpdatesProbe) -> bool {

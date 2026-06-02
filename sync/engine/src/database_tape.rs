@@ -11,7 +11,8 @@ use crate::{
     errors::Error,
     types::{
         Coro, DatabaseChange, DatabaseChangeType, DatabaseSchemaKind, DatabaseSchemaReplay,
-        DatabaseTapeOperation, DatabaseTapeRowChangeType, SyncEngineIoResult,
+        DatabaseTapeOperation, DatabaseTapeRowChange, DatabaseTapeRowChangeType,
+        SyncEngineIoResult,
     },
     wal_session::WalSession,
     Result,
@@ -31,6 +32,9 @@ pub struct DatabaseTape {
 const DEFAULT_CDC_TABLE_NAME: &str = "turso_cdc";
 const DEFAULT_CDC_MODE: &str = "full";
 const DEFAULT_CHANGES_BATCH_SIZE: usize = 100;
+const TURSO_CDC_VERSION_TABLE_NAME: &str = "turso_cdc_version";
+const TURSO_INTERNAL_PREFIX: &str = "__turso_internal_";
+const TURSO_SYNC_TABLE_NAME: &str = "turso_sync_last_change_id";
 pub const CDC_PRAGMA_NAME: &str = "capture_data_changes_conn";
 
 #[derive(Debug, Clone)]
@@ -630,6 +634,9 @@ impl DatabaseChangesIterator {
                 if self.ignore_schema_changes && change.table_name == SQLITE_SCHEMA_TABLE {
                     continue;
                 }
+                if !is_tape_replayable_change(change, &self.cdc_table)? {
+                    continue;
+                }
             }
             return Ok(next);
         }
@@ -681,6 +688,54 @@ impl DatabaseChangesIterator {
         }
         Ok(())
     }
+}
+
+fn is_tape_replayable_change(change: &DatabaseTapeRowChange, cdc_table: &str) -> Result<bool> {
+    if change.table_name != SQLITE_SCHEMA_TABLE {
+        return Ok(is_tape_replayable_object(&change.table_name, cdc_table));
+    }
+
+    match &change.change {
+        DatabaseTapeRowChangeType::Delete { before } => {
+            is_tape_replayable_schema_record(before, cdc_table)
+        }
+        DatabaseTapeRowChangeType::Insert { after } => {
+            is_tape_replayable_schema_record(after, cdc_table)
+        }
+        DatabaseTapeRowChangeType::Update { before, after, .. } => {
+            Ok(is_tape_replayable_schema_record(before, cdc_table)?
+                && is_tape_replayable_schema_record(after, cdc_table)?)
+        }
+    }
+}
+
+fn is_tape_replayable_schema_record(record: &[turso_core::Value], cdc_table: &str) -> Result<bool> {
+    let Some(name) = sqlite_schema_record_name(record)? else {
+        return Ok(false);
+    };
+    Ok(is_tape_replayable_object(name, cdc_table))
+}
+
+fn sqlite_schema_record_name(record: &[turso_core::Value]) -> Result<Option<&str>> {
+    if record.len() < 2 {
+        return Err(Error::DatabaseTapeError(format!(
+            "sqlite_schema record must have at least 2 columns, got {}",
+            record.len()
+        )));
+    }
+    match &record[1] {
+        turso_core::Value::Null => Ok(None),
+        value => value.to_text().map(Some).ok_or_else(|| {
+            Error::DatabaseTapeError(format!("sqlite_schema.name must be text, got {value:?}"))
+        }),
+    }
+}
+
+fn is_tape_replayable_object(name: &str, cdc_table: &str) -> bool {
+    !name.starts_with(TURSO_INTERNAL_PREFIX)
+        && name != TURSO_SYNC_TABLE_NAME
+        && name != cdc_table
+        && name != TURSO_CDC_VERSION_TABLE_NAME
 }
 
 #[derive(Clone)]
