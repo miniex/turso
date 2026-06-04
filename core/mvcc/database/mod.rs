@@ -566,16 +566,10 @@ fn rootpage_for_mv_table_id<Clock: LogicalClock>(
 }
 
 #[cfg(feature = "conn_raw_api")]
-fn portable_table_name_for_mv_table_id<Clock: LogicalClock>(
-    connection: &Connection,
-    mvcc_store: &MvStore<Clock>,
-    table_id: MVTableId,
-) -> Option<String> {
-    let rootpage = rootpage_for_mv_table_id(mvcc_store, table_id);
+fn table_name_for_rootpage_in_schema(schema: &Schema, rootpage: i64) -> Option<String> {
     if rootpage == 0 {
         return None;
     }
-    let schema = connection.schema.read();
     if let Some(name) = schema.table_name_for_root_page(rootpage) {
         return Some(name.to_string());
     }
@@ -586,6 +580,29 @@ fn portable_table_name_for_mv_table_id<Clock: LogicalClock>(
     schema
         .table_name_for_root_page(alternate_rootpage)
         .map(ToString::to_string)
+}
+
+#[cfg(feature = "conn_raw_api")]
+fn table_name_for_rootpage(connection: &Connection, rootpage: i64) -> Option<String> {
+    {
+        let schema = connection.schema.read();
+        if let Some(name) = table_name_for_rootpage_in_schema(&schema, rootpage) {
+            return Some(name);
+        }
+    }
+
+    let schema = connection.db.schema.lock();
+    table_name_for_rootpage_in_schema(&schema, rootpage)
+}
+
+#[cfg(feature = "conn_raw_api")]
+fn portable_table_name_for_mv_table_id<Clock: LogicalClock>(
+    connection: &Connection,
+    mvcc_store: &MvStore<Clock>,
+    table_id: MVTableId,
+) -> Option<String> {
+    let rootpage = rootpage_for_mv_table_id(mvcc_store, table_id);
+    table_name_for_rootpage(connection, rootpage)
 }
 
 #[cfg(feature = "conn_raw_api")]
@@ -2412,44 +2429,13 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
             }
 
             if !needed_rootpages.is_empty() {
-                let schema = self.connection.schema.read();
                 for rootpage in needed_rootpages {
-                    let (resolved_table_id, table_ref) = if let Some(name) =
-                        schema.table_name_for_root_page(rootpage)
-                    {
-                        (
-                            portable_table_id_from_rootpage(rootpage),
-                            PortableTableRef {
-                                name: name.to_string(),
-                            },
-                        )
-                    } else if rootpage < 0 {
-                        let checkpointed_rootpage = -rootpage;
-                        let Some(name) = schema.table_name_for_root_page(checkpointed_rootpage)
-                        else {
-                            continue;
-                        };
-                        (
-                            portable_table_id_from_rootpage(checkpointed_rootpage),
-                            PortableTableRef {
-                                name: name.to_string(),
-                            },
-                        )
-                    } else if rootpage > 0 {
-                        let uncheckpointed_rootpage = -rootpage;
-                        let Some(name) = schema.table_name_for_root_page(uncheckpointed_rootpage)
-                        else {
-                            continue;
-                        };
-                        (
-                            portable_table_id_from_rootpage(rootpage),
-                            PortableTableRef {
-                                name: name.to_string(),
-                            },
-                        )
-                    } else {
+                    let Some(name) = table_name_for_rootpage(&self.connection, rootpage) else {
                         continue;
                     };
+                    let resolved_rootpage = if rootpage < 0 { -rootpage } else { rootpage };
+                    let resolved_table_id = portable_table_id_from_rootpage(resolved_rootpage);
+                    let table_ref = PortableTableRef { name };
                     table_refs_by_id.insert(resolved_table_id, table_ref);
                 }
 
