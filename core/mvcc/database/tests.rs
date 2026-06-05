@@ -12653,6 +12653,43 @@ fn test_mvcc_portable_changes_do_not_infer_origin_from_application_table() {
 
 #[cfg(feature = "conn_raw_api")]
 #[test]
+fn test_mvcc_portable_changes_ignore_sync_table_created_and_written_in_same_txn() {
+    let db = MvccTestDb::new_with_portable_logical_changes();
+    db.conn
+        .execute("CREATE TABLE items(id INTEGER PRIMARY KEY, payload TEXT)")
+        .unwrap();
+
+    db.conn.execute("BEGIN").unwrap();
+    db.conn
+        .execute(
+            "CREATE TABLE IF NOT EXISTS turso_sync_last_change_id(
+                client_id TEXT PRIMARY KEY,
+                pull_gen INTEGER,
+                change_id INTEGER
+            )",
+        )
+        .unwrap();
+    db.conn
+        .execute("INSERT INTO turso_sync_last_change_id VALUES ('client-a', 1, 10)")
+        .unwrap();
+    db.conn
+        .execute("INSERT INTO items VALUES (1, 'visible')")
+        .unwrap();
+    db.conn.execute("COMMIT").unwrap();
+
+    let portable_changes = collect_mvcc_portable_change_bytes(&db.conn);
+    let txns = decode_portable_change_txns(&portable_changes);
+    let objects = decoded_object_maps(&txns);
+
+    assert!(!bytes_contain(
+        &portable_changes,
+        b"turso_sync_last_change_id"
+    ));
+    assert!(objects.iter().any(|object| object.name == "items"));
+}
+
+#[cfg(feature = "conn_raw_api")]
+#[test]
 fn test_mvcc_portable_changes_metadata_does_not_auto_enable_or_get_consumed() {
     let io = Arc::new(MemoryIO::new());
     let db = Database::open_file(io, ":memory:").unwrap();
@@ -12683,6 +12720,90 @@ fn test_mvcc_portable_changes_metadata_does_not_auto_enable_or_get_consumed() {
         clients,
         vec!["client-a".to_string(), "client-a".to_string()]
     );
+}
+
+#[cfg(feature = "conn_raw_api")]
+#[test]
+fn test_mvcc_portable_changes_resolve_uncheckpointed_table_from_another_connection() {
+    let io = Arc::new(MemoryIO::new());
+    let db = Database::open_file(io, ":memory:").unwrap();
+    let creator = db.connect().unwrap();
+    creator.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+    creator
+        .execute("CREATE TABLE items(id INTEGER PRIMARY KEY, payload TEXT)")
+        .unwrap();
+    creator
+        .execute("ALTER TABLE items ADD COLUMN note TEXT")
+        .unwrap();
+
+    let writer = db.connect().unwrap();
+    writer.set_portable_logical_changes_enabled(true);
+    writer
+        .execute("INSERT INTO items VALUES (1, 'alpha', 'note')")
+        .unwrap();
+
+    let portable_changes = collect_mvcc_portable_change_bytes(&writer);
+    let txns = decode_portable_change_txns(&portable_changes);
+    let objects = decoded_object_maps(&txns);
+
+    assert!(
+        objects.iter().any(|object| object.name == "items"),
+        "DML-only portable frame should resolve the uncheckpointed table from shared schema"
+    );
+}
+
+#[cfg(feature = "conn_raw_api")]
+#[test]
+fn test_mvcc_portable_changes_resolve_added_column_schema_from_another_connection() {
+    let io = Arc::new(MemoryIO::new());
+    let db = Database::open_file(io, ":memory:").unwrap();
+    let setup = db.connect().unwrap();
+    setup.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+    setup.set_portable_logical_changes_enabled(true);
+    setup
+        .execute(
+            "CREATE TABLE items(
+                id INTEGER PRIMARY KEY,
+                owner TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                rev INTEGER NOT NULL DEFAULT 0
+            )",
+        )
+        .unwrap();
+    setup
+        .execute(
+            "CREATE INDEX \"items owner rev idx\"
+             ON items(owner, rev)",
+        )
+        .unwrap();
+    setup
+        .execute(
+            "INSERT INTO items(id, owner, payload, rev)
+             VALUES (1, 'seed-a', 'alpha', 1), (2, 'seed-b', 'beta', 1)",
+        )
+        .unwrap();
+
+    let schema_writer = db.connect().unwrap();
+    schema_writer.set_portable_logical_changes_enabled(true);
+    schema_writer
+        .execute("ALTER TABLE items ADD COLUMN note TEXT")
+        .unwrap();
+
+    let writer = db.connect().unwrap();
+    writer.set_portable_logical_changes_enabled(true);
+    writer
+        .execute(
+            "INSERT INTO items
+             (id, owner, payload, rev, note)
+             VALUES (100, 'writer-a', 'payload-after-alter', 1, 'note-after-alter')",
+        )
+        .unwrap();
+
+    let portable_changes = collect_mvcc_portable_change_bytes(&writer);
+    let txns = decode_portable_change_txns(&portable_changes);
+    let objects = decoded_object_maps(&txns);
+
+    assert!(objects.iter().any(|object| object.name == "items"));
 }
 
 #[cfg(feature = "conn_raw_api")]

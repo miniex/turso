@@ -170,7 +170,7 @@ fn logical_op_to_tape_operations(
                     change_id: 0,
                     change_time: commit_ts,
                     change: DatabaseTapeRowChangeType::Insert {
-                        after: parse_bin_record(op.record.to_vec())?,
+                        after: parse_bin_record(&op.record)?,
                     },
                     table_name: op.table_name,
                     id: op.rowid,
@@ -446,84 +446,10 @@ fn logical_txn_to_tape_operations_with_table_map(
 }
 
 /// Counts logical transactions and replayable operations in a streamed file.
-#[derive(Debug, Default)]
-pub struct LogicalReplaySummary {
-    pub total_txns: usize,
-    pub skipped_client_txns: usize,
-    pub replayed_txns: usize,
-    pub row_ops: usize,
-    pub schema_ops: usize,
-    pub row_ops_by_table: std::collections::BTreeMap<String, usize>,
-}
-
 /// Rows actually applied while replaying remote logical transactions.
 #[derive(Debug, Default)]
 pub struct LogicalReplayApplyStats {
     pub touched_rows: std::collections::BTreeSet<(String, i64)>,
-}
-
-/// Scans a length-delimited logical transaction file without applying it.
-///
-/// The optional excluded client uses the same acknowledgement test as replay so
-/// diagnostics match the apply path.
-pub async fn summarize_logical_transactions_file<Ctx>(
-    coro: &Coro<Ctx>,
-    txns_file: &Arc<dyn turso_core::File>,
-    excluded_client_id: Option<&str>,
-) -> Result<LogicalReplaySummary> {
-    let size = txns_file.size()?;
-    let mut file_offset = 0u64;
-    let mut bytes = BytesMut::new();
-    let mut summary = LogicalReplaySummary::default();
-    loop {
-        while let Some(txn) = take_proto_message_from_bytes::<LogicalTxnData>(&mut bytes)? {
-            summary.total_txns += 1;
-            if excluded_client_id
-                .map(|client_id| logical_txn_acknowledges_client(&txn, client_id))
-                .transpose()?
-                .unwrap_or(false)
-            {
-                summary.skipped_client_txns += 1;
-                continue;
-            }
-            summary.replayed_txns += 1;
-            for op in &txn.ops {
-                let op_type = LogicalOpType::try_from(op.op_type).map_err(|_| {
-                    Error::DatabaseSyncEngineError(format!(
-                        "unknown logical op type: {}",
-                        op.op_type
-                    ))
-                })?;
-                match op_type {
-                    LogicalOpType::UpsertRow | LogicalOpType::DeleteRow => {
-                        if is_logically_replayable_table(&op.table_name) {
-                            summary.row_ops += 1;
-                            *summary
-                                .row_ops_by_table
-                                .entry(op.table_name.clone())
-                                .or_default() += 1;
-                        }
-                    }
-                    LogicalOpType::Schema => {
-                        if is_logically_replayable_table(&op.schema_name) {
-                            summary.schema_ops += 1;
-                        }
-                    }
-                    LogicalOpType::UpdateHeader => {}
-                }
-            }
-        }
-        if file_offset >= size {
-            if bytes.is_empty() {
-                break;
-            }
-            return Err(Error::DatabaseSyncEngineError(
-                "unexpected end of protobuf message in file".to_string(),
-            ));
-        }
-        read_proto_file_chunk(coro, txns_file, size, &mut file_offset, &mut bytes).await?;
-    }
-    Ok(summary)
 }
 
 /// Returns whether a logical transaction represents this client's own write.
@@ -543,7 +469,7 @@ fn logical_txn_acknowledges_client(txn: &LogicalTxnData, client_id: &str) -> Res
         if op.table_name != TURSO_SYNC_TABLE_NAME {
             continue;
         }
-        let values = parse_bin_record(op.record.to_vec())?;
+        let values = parse_bin_record(&op.record)?;
         if values
             .first()
             .and_then(|value| value.to_text())
@@ -1444,22 +1370,20 @@ fn decode_recovery_ops_to_logical_txn(
                 let record = &payload[payload_cursor..];
                 if table_id == MVCC_SQLITE_SCHEMA_TABLE_ID {
                     schema_deltas.entry(rowid).or_default().new = Some(decode_schema_row(record)?);
-                } else {
-                    if let Some(table_name) = object_names.get(&table_id) {
-                        row_ops.push(LogicalOp {
-                            op_type: LogicalOpType::UpsertRow as i32,
-                            table_name: table_name.clone(),
-                            rowid,
-                            record: Bytes::copy_from_slice(record),
-                            sql: String::new(),
-                            user_version: None,
-                            application_id: None,
-                            schema_action: None,
-                            schema_kind: None,
-                            schema_name: String::new(),
-                            stable_table_id: 0,
-                        });
-                    }
+                } else if let Some(table_name) = object_names.get(&table_id) {
+                    row_ops.push(LogicalOp {
+                        op_type: LogicalOpType::UpsertRow as i32,
+                        table_name: table_name.clone(),
+                        rowid,
+                        record: Bytes::copy_from_slice(record),
+                        sql: String::new(),
+                        user_version: None,
+                        application_id: None,
+                        schema_action: None,
+                        schema_kind: None,
+                        schema_name: String::new(),
+                        stable_table_id: 0,
+                    });
                 }
             }
             MVCC_OP_DELETE_TABLE => {
@@ -1475,22 +1399,20 @@ fn decode_recovery_ops_to_logical_txn(
                     }
                     schema_deltas.entry(rowid).or_default().old =
                         Some(decode_schema_row(&identity_record)?);
-                } else {
-                    if let Some(table_name) = object_names.get(&table_id) {
-                        row_ops.push(LogicalOp {
-                            op_type: LogicalOpType::DeleteRow as i32,
-                            table_name: table_name.clone(),
-                            rowid,
-                            record: Bytes::new(),
-                            sql: String::new(),
-                            user_version: None,
-                            application_id: None,
-                            schema_action: None,
-                            schema_kind: None,
-                            schema_name: String::new(),
-                            stable_table_id: 0,
-                        });
-                    }
+                } else if let Some(table_name) = object_names.get(&table_id) {
+                    row_ops.push(LogicalOp {
+                        op_type: LogicalOpType::DeleteRow as i32,
+                        table_name: table_name.clone(),
+                        rowid,
+                        record: Bytes::new(),
+                        sql: String::new(),
+                        user_version: None,
+                        application_id: None,
+                        schema_action: None,
+                        schema_kind: None,
+                        schema_name: String::new(),
+                        stable_table_id: 0,
+                    });
                 }
             }
             MVCC_OP_UPSERT_INDEX | MVCC_OP_DELETE_INDEX => {}
@@ -2907,7 +2829,7 @@ async fn describe_last_change_id_row<Ctx>(
         "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'turso_sync_last_change_id'",
     ) {
         Ok(mut stmt) => match run_stmt_expect_one_row(coro, &mut stmt).await {
-            Ok(Some(row)) => format!("{:?}", row),
+            Ok(Some(row)) => format!("{row:?}"),
             Ok(None) => "<missing>".to_string(),
             Err(error) => format!("<failed to query schema: {error}>"),
         },
@@ -3158,6 +3080,7 @@ pub async fn push_logical_changes<IO: SyncEngineIo, Ctx>(
 ///
 /// Returns the count of rows that actually produced SQL steps
 /// (post-transformation, excluding `Skip`).
+#[allow(clippy::too_many_arguments)]
 async fn send_push_batch<IO: SyncEngineIo, Ctx>(
     ctx: &SyncOperationCtx<'_, IO, Ctx>,
     generator: &DatabaseReplayGenerator,
@@ -5103,7 +5026,7 @@ mod tests {
         extension_block.extend_from_slice(&MVCC_EXTENSION_TYPE_PORTABLE_CHANGES.to_le_bytes());
         extension_block.extend_from_slice(&0u16.to_le_bytes());
         extension_block.extend_from_slice(&(portable_payload.len() as u32).to_le_bytes());
-        extension_block.extend_from_slice(&portable_payload);
+        extension_block.extend_from_slice(portable_payload);
 
         let mut frame = Vec::new();
         frame.extend_from_slice(&MVCC_TX_EXT_FRAME_MAGIC.to_le_bytes());

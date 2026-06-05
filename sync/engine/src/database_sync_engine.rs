@@ -20,9 +20,9 @@ use crate::{
         apply_transformation, bootstrap_db_file, connect_untracked, count_local_changes, has_table,
         is_logically_replayable_table, max_local_change_id, pull_updates_v1, push_logical_changes,
         read_last_change_id, read_logical_replay_table_map, read_wal_salt, reset_wal_file,
-        summarize_logical_transactions_file, update_last_change_id, wait_all_results,
-        wal_apply_from_file, wal_pull_to_file, PullUpdatesV1Result, SyncEngineIoStats,
-        SyncOperationCtx, PAGE_SIZE, WAL_FRAME_HEADER, WAL_FRAME_SIZE,
+        update_last_change_id, wait_all_results, wal_apply_from_file, wal_pull_to_file,
+        PullUpdatesV1Result, SyncEngineIoStats, SyncOperationCtx, PAGE_SIZE, WAL_FRAME_HEADER,
+        WAL_FRAME_SIZE,
     },
     database_tape::{
         run_stmt_once, DatabaseChangesIteratorMode, DatabaseChangesIteratorOpts,
@@ -450,6 +450,7 @@ fn logical_mvcc_pull_disable_reason(
 /// client's writes that are already included in the installed page snapshot.
 /// Incremental logical pulls cannot use that hint because self-originated
 /// transactions are filtered separately by client metadata.
+#[allow(clippy::too_many_arguments)]
 fn resolve_local_replay_floor_change_id(
     use_pushed_change_hint: bool,
     use_pushed_replay_floor_hint: bool,
@@ -506,48 +507,6 @@ fn use_pushed_replay_floor_hint_for_local_replay(stream_kind: DbChangesStreamKin
     matches!(stream_kind, DbChangesStreamKind::Logical)
 }
 
-/// Enables expensive integrity diagnostics for remote apply debugging.
-fn remote_apply_integrity_debug_enabled() -> bool {
-    std::env::var("TURSO_SYNC_DEBUG_REMOTE_APPLY_INTEGRITY")
-        .ok()
-        .is_some_and(|value| {
-            matches!(
-                value.to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-}
-
-/// Runs `PRAGMA integrity_check` when remote-apply diagnostics are enabled.
-async fn debug_integrity_check<Ctx>(
-    coro: &Coro<Ctx>,
-    conn: &Arc<turso_core::Connection>,
-    path: &str,
-    label: &str,
-) -> Result<()> {
-    if !remote_apply_integrity_debug_enabled() {
-        return Ok(());
-    }
-
-    let mut stmt = conn.prepare("PRAGMA integrity_check")?;
-    let mut rows = Vec::new();
-    while let Some(row) = run_stmt_once(coro, &mut stmt).await? {
-        let value = match row.get_value(0) {
-            Value::Text(text) => text.as_str().to_string(),
-            other => format!("{other:?}"),
-        };
-        rows.push(value);
-    }
-    tracing::warn!(
-        "apply_changes(path={}): integrity_check after {}: {:?}",
-        path,
-        label,
-        rows
-    );
-
-    Ok(())
-}
-
 fn quote_sync_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
@@ -578,44 +537,6 @@ async fn rowid_exists_after_remote_apply<Ctx>(
     };
     stmt.bind_at(1.try_into().unwrap(), Value::from_i64(change.id))?;
     Ok(run_stmt_once(coro, &mut stmt).await?.is_some())
-}
-
-/// Logs local CDC replay shape for remote-apply diagnostics.
-fn log_local_change_summary(
-    path: &str,
-    label: &str,
-    changes: &[crate::types::DatabaseTapeRowChange],
-) {
-    if !remote_apply_integrity_debug_enabled() {
-        return;
-    }
-
-    let mut by_table = std::collections::BTreeMap::<&str, usize>::new();
-    for change in changes {
-        *by_table.entry(change.table_name.as_str()).or_default() += 1;
-    }
-    let preview = changes
-        .iter()
-        .take(32)
-        .map(|change| {
-            let kind = match &change.change {
-                crate::types::DatabaseTapeRowChangeType::Insert { .. } => "insert",
-                crate::types::DatabaseTapeRowChangeType::Update { .. } => "update",
-                crate::types::DatabaseTapeRowChangeType::Delete { .. } => "delete",
-            };
-            format!(
-                "{}:{}:{}:{}",
-                change.change_id, change.table_name, change.id, kind
-            )
-        })
-        .collect::<Vec<_>>();
-    tracing::warn!(
-        "apply_changes(path={}): {} local row changes by table: {:?}; preview={:?}",
-        path,
-        label,
-        by_table,
-        preview
-    );
 }
 
 /// Returns true for pull-update streams that physically install remote pages.
@@ -1143,6 +1064,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         Ok(meta)
     }
 
+    #[allow(clippy::type_complexity)]
     pub fn init_db_storage(
         io: Arc<dyn turso_core::IO>,
         sync_engine_io: SyncEngineIoStats<IO>,
@@ -1740,7 +1662,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             match logical_pull {
                 Ok((next_revision, PullUpdatesV1Result::Pages { replace_base })) => {
                     if replace_base || initial_logical_page_bootstrap {
-                        tracing::warn!(
+                        tracing::debug!(
                             "wait_changes(path={}): logical pull using replace-base page apply: server_replace_base={} initial_bootstrap={}",
                             self.main_db_path,
                             replace_base,
@@ -2376,19 +2298,6 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                         },
                     },
                 };
-                if remote_apply_integrity_debug_enabled() {
-                    let summary = summarize_logical_transactions_file(
-                        coro,
-                        changes_file,
-                        Some(&self.client_unique_id),
-                    )
-                    .await?;
-                    tracing::warn!(
-                        "apply_changes(path={}): remote logical replay summary before apply: {:?}",
-                        self.main_db_path,
-                        summary
-                    );
-                }
                 let replay_stats =
                     apply_logical_transactions_file_without_commit_excluding_client_txns_with_table_map_and_stats(
                     coro,
@@ -2474,18 +2383,6 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                 );
             }
         }
-        debug_integrity_check(
-            coro,
-            phase_conn,
-            &self.main_db_path,
-            "remote apply before local CDC replay",
-        )
-        .await
-        .map_err(|error| {
-            Error::DatabaseSyncEngineError(format!(
-                "failed integrity check after remote apply before local CDC replay: {error}",
-            ))
-        })?;
         // Pull apply rolls back the local WAL while installing remote changes,
         // so pending local CDC must be replayed locally afterward. Page and
         // replace-base transports include this client's pushed writes in the
@@ -2631,12 +2528,19 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             local_changes
         };
         let replayed_local_changes = !local_changes.is_empty();
+        let delay_cdc_for_pushed_self_replay = logical_replay_conn.is_some()
+            && replaying_pushed_self_range
+            && had_cdc_table;
+        let mut recaptured_local_changes = replayed_local_changes;
+        if delay_cdc_for_pushed_self_replay {
+            recaptured_local_changes = false;
+        }
+        let mut preserve_local_replay_floor = None;
         tracing::info!(
             "apply_changes(path={}): collected {} changes",
             self.main_db_path,
             local_changes.len()
         );
-        log_local_change_summary(&self.main_db_path, "collected", &local_changes);
         // Phase 6: replay local changes
         // we can skip this phase if we are sure that we had no local changes before
         if !local_changes.is_empty() || local_rollback != 0 || remote_rollback != 0 || had_cdc_table
@@ -2667,7 +2571,8 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                 .inspect_err(|e| tracing::error!("update_last_change_id failed: {e}"))?;
             }
 
-            if replayed_local_changes && had_cdc_table {
+            let mut cdc_enabled_for_local_replay = false;
+            if replayed_local_changes && had_cdc_table && !delay_cdc_for_pushed_self_replay {
                 tracing::info!(
                     "apply_changes(path={}): reinitialize CDC pragma before local replay",
                     self.main_db_path,
@@ -2682,6 +2587,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                 if replace_base_pages || raw_page_replay_on_sql_conn {
                     phase_conn.publish_schema_if_newer();
                 }
+                cdc_enabled_for_local_replay = true;
             }
 
             let mut replay = DatabaseReplaySession {
@@ -2731,6 +2637,14 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             assert!(!replay.conn().get_auto_commit());
             // Replay local changes collected on Phase 5
             for (i, change) in local_changes.into_iter().enumerate() {
+                let should_recapture_change = !delay_cdc_for_pushed_self_replay
+                    || change.change_id > last_pushed_change_id_hint;
+                // A replayed DELETE can be a no-op if the pre-apply checkpoint
+                // has already made the local delete visible. Preserve the
+                // original CDC row as pushable in that case.
+                let preserve_original_change_floor = should_recapture_change
+                    && matches!(&change.change, DatabaseTapeRowChangeType::Delete { .. });
+                let original_change_floor = change.change_id.saturating_sub(1);
                 let operation = if should_transform_local_change(&change) {
                     if let Some(transformed) = &mut transformed {
                         let transform_result = std::mem::replace(
@@ -2753,6 +2667,31 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                 } else {
                     DatabaseTapeOperation::RowChange(change)
                 };
+                if should_recapture_change && had_cdc_table && !cdc_enabled_for_local_replay {
+                    tracing::info!(
+                        "apply_changes(path={}): reinitialize CDC pragma before unpushed local replay",
+                        self.main_db_path,
+                    );
+                    phase_conn
+                        .pragma_update(CDC_PRAGMA_NAME, "'full'")
+                        .map_err(|error| {
+                            Error::DatabaseSyncEngineError(format!(
+                                "failed to reinitialize CDC pragma before unpushed local replay: {error}",
+                            ))
+                        })?;
+                    cdc_enabled_for_local_replay = true;
+                }
+                if should_recapture_change {
+                    recaptured_local_changes = true;
+                }
+                if preserve_original_change_floor {
+                    preserve_local_replay_floor = Some(
+                        preserve_local_replay_floor
+                            .map_or(original_change_floor, |floor: i64| {
+                                floor.min(original_change_floor)
+                            }),
+                    );
+                }
                 maybe_inject_replace_base_local_replay_failure(replace_base_pages, i)?;
                 replay.replay(coro, operation).await.map_err(|error| {
                     Error::DatabaseSyncEngineError(format!(
@@ -2762,14 +2701,6 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             }
             assert!(!replay.conn().get_auto_commit());
         }
-        debug_integrity_check(
-            coro,
-            phase_conn,
-            &self.main_db_path,
-            "local CDC replay before commit",
-        )
-        .await?;
-
         // Final: now we did all necessary operations as one big transaction and we are ready to commit
         if let Some(logical_conn) = logical_replay_conn {
             logical_conn.execute("COMMIT").map_err(|error| {
@@ -2798,10 +2729,12 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                     change_id
                 );
                 let synced_change_id = synced_change_id_after_remote_apply(
-                    replayed_local_changes,
+                    recaptured_local_changes,
                     pre_apply_local_change_id,
                     change_id,
                 );
+                let synced_change_id = preserve_local_replay_floor
+                    .map_or(synced_change_id, |floor| synced_change_id.min(floor));
                 if raw_page_replay_on_sql_conn {
                     rebuild_local_sync_metadata_table(
                         coro,
@@ -2856,8 +2789,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         if raw_page_replay_on_sql_conn {
             main_conn.publish_schema_if_newer();
         }
-        if (had_cdc_table || replace_base_pages) && (replace_base_pages || raw_page_replay_on_sql_conn)
-        {
+        if replace_base_pages || had_cdc_table && raw_page_replay_on_sql_conn {
             publish_schema_after_raw_wal_replay(&main_conn, "raw WAL replay")?;
             tracing::info!(
                 "apply_changes(path={}): reinitialize CDC pragma after WAL replay commit",
@@ -2880,10 +2812,12 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                 change_id
             );
             let synced_change_id = synced_change_id_after_remote_apply(
-                replayed_local_changes,
+                recaptured_local_changes,
                 pre_apply_local_change_id,
                 change_id,
             );
+            let synced_change_id = preserve_local_replay_floor
+                .map_or(synced_change_id, |floor| synced_change_id.min(floor));
             update_last_change_id(
                 coro,
                 &main_conn,
@@ -3088,17 +3022,19 @@ mod tests {
         database_tape::{run_stmt_once, DatabaseChangesIteratorMode, DatabaseChangesIteratorOpts},
         io_operations::IoOperations,
         server_proto::{
-            PullUpdatesApplyMode, PullUpdatesReqProtoBody, PullUpdatesRespProtoBody,
-            PullUpdatesStreamKind,
+            LogicalOp, LogicalOpType, LogicalTxnData, PullUpdatesApplyMode,
+            PullUpdatesReqProtoBody, PullUpdatesRespProtoBody, PullUpdatesStreamKind,
         },
         types::{
             Coro, DatabaseMetadata, DatabasePullRevision, DatabaseRowMutation,
             DatabaseRowTransformResult, DatabaseSavedConfiguration,
-            DatabaseSyncEngineProtocolVersion, DatabaseTapeOperation, DbChangesStatus,
-            DbChangesStreamKind, PartialSyncOpts, SyncEngineIoResult, DATABASE_METADATA_VERSION,
+            DatabaseSyncEngineProtocolVersion, DatabaseTapeOperation, DatabaseTapeRowChangeType,
+            DbChangesStatus, DbChangesStreamKind, PartialSyncOpts, SyncEngineIoResult,
+            DATABASE_METADATA_VERSION,
         },
         Result,
     };
+    use bytes::Bytes;
     use prost::Message;
     use std::sync::{Arc, Mutex};
     use tempfile::NamedTempFile;
@@ -3199,6 +3135,7 @@ mod tests {
 
     struct CapturingSyncEngineIo {
         response: Mutex<Option<Vec<u8>>>,
+        #[allow(clippy::type_complexity)]
         request: Mutex<Option<(String, String, Option<Vec<u8>>)>>,
     }
 
@@ -3317,6 +3254,43 @@ mod tests {
             coro.yield_(SyncEngineIoResult::IO).await?;
         }
         Ok(changes_file)
+    }
+
+    fn logical_record(values: &[turso_core::Value]) -> Bytes {
+        turso_core::types::ImmutableRecord::from_values(values.iter(), values.len())
+            .unwrap()
+            .into_payload()
+            .into()
+    }
+
+    fn logical_upsert_row(table_name: &str, rowid: i64, record: Bytes) -> LogicalOp {
+        LogicalOp {
+            op_type: LogicalOpType::UpsertRow as i32,
+            table_name: table_name.to_string(),
+            rowid,
+            record,
+            sql: String::new(),
+            user_version: None,
+            application_id: None,
+            schema_action: None,
+            schema_kind: None,
+            schema_name: String::new(),
+            stable_table_id: 0,
+        }
+    }
+
+    fn write_logical_txns_file(
+        io: &Arc<dyn turso_core::IO>,
+        changes_path: &str,
+        txns: &[LogicalTxnData],
+    ) -> Arc<dyn turso_core::File> {
+        let mut bytes = Vec::new();
+        for txn in txns {
+            bytes.extend_from_slice(&txn.encode_length_delimited_to_vec());
+        }
+        std::fs::write(changes_path, bytes).unwrap();
+        io.open_file(changes_path, OpenFlags::ReadOnly, false)
+            .unwrap()
     }
 
     #[test]
@@ -4127,6 +4101,215 @@ mod tests {
                 let row = run_stmt_once(&coro, &mut stmt).await?.unwrap();
                 assert_eq!(row.get_value(0).to_text().unwrap(), "local-pushed");
                 assert_eq!(row.get_value(1).to_text().unwrap(), "remote-backfill");
+                Result::Ok(())
+            }
+        });
+
+        loop {
+            match gen.resume_with(Ok(())) {
+                genawaiter::GeneratorState::Yielded(..) => io.step().unwrap(),
+                genawaiter::GeneratorState::Complete(result) => {
+                    result.unwrap();
+                    break;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn logical_replay_preserves_unpushed_delete_after_pushed_self_replay() {
+        let main_file = NamedTempFile::new().unwrap();
+        let changes_file = NamedTempFile::new().unwrap();
+        let main_path = main_file.path().to_str().unwrap().to_string();
+        let changes_path = changes_file.path().to_str().unwrap().to_string();
+
+        let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let sync_engine_io = SyncEngineIoStats::new(Arc::new(NoopSyncEngineIo));
+        let new_revision = DatabasePullRevision::V1 {
+            revision: "logical-revision".to_string(),
+        };
+
+        let mut gen = genawaiter::sync::Gen::new({
+            let io = io.clone();
+            let sync_engine_io = sync_engine_io.clone();
+            let main_path = main_path.clone();
+            let changes_path = changes_path.clone();
+            let new_revision = new_revision.clone();
+            move |coro| async move {
+                let coro: Coro<()> = coro.into();
+                let engine = DatabaseSyncEngine::create_db(
+                    &coro,
+                    io.clone(),
+                    sync_engine_io.clone(),
+                    &main_path,
+                    default_test_opts(),
+                )
+                .await?;
+                let conn = engine.connect_rw(&coro).await?;
+                conn.execute("PRAGMA journal_mode = 'mvcc'")?;
+                conn.execute("CREATE TABLE items(id INTEGER PRIMARY KEY, status INTEGER)")?;
+                conn.execute("INSERT INTO items VALUES (1, 0), (2, 0)")?;
+                let replay_floor_change_id = max_local_change_id(&coro, &conn).await?.unwrap_or(0);
+                update_last_change_id(
+                    &coro,
+                    &conn,
+                    &engine.client_unique_id,
+                    5,
+                    replay_floor_change_id,
+                )
+                .await?;
+                conn.checkpoint(CheckpointMode::Truncate {
+                    upper_bound_inclusive: None,
+                })?;
+
+                conn.execute("UPDATE items SET status = 1 WHERE id = 1")?;
+                let pushed_change_id = max_local_change_id(&coro, &conn).await?.unwrap_or(0);
+                conn.execute("DELETE FROM items WHERE id = 2")?;
+                update_last_change_id(&coro, &conn, &engine.client_unique_id, 5, pushed_change_id)
+                    .await?;
+                let mut original_delete_change_id = None;
+                let mut before_pull_iterator =
+                    engine
+                        .main_tape
+                        .iterate_changes(DatabaseChangesIteratorOpts {
+                            first_change_id: Some(pushed_change_id + 1),
+                            mode: DatabaseChangesIteratorMode::Apply,
+                            ignore_schema_changes: true,
+                            ..Default::default()
+                        })?;
+                while let Some(operation) = before_pull_iterator.next(&coro).await? {
+                    match operation {
+                        DatabaseTapeOperation::RowChange(change)
+                            if change.table_name == "items"
+                                && change.id == 2
+                                && matches!(
+                                    &change.change,
+                                    DatabaseTapeRowChangeType::Delete { .. }
+                                ) =>
+                        {
+                            original_delete_change_id = Some(change.change_id);
+                        }
+                        DatabaseTapeOperation::RowChange(_) | DatabaseTapeOperation::Commit => {}
+                        DatabaseTapeOperation::StmtReplay(_)
+                        | DatabaseTapeOperation::SchemaReplay(_) => {
+                            panic!("changes iterator must not produce replay operations")
+                        }
+                    }
+                }
+                let original_delete_change_id =
+                    original_delete_change_id.expect("expected local delete CDC row before pull");
+                drop(conn);
+
+                engine
+                    .update_meta(&coro, |meta| {
+                        meta.last_pushed_pull_gen_hint = 5;
+                        meta.last_pushed_change_id_hint = pushed_change_id;
+                        meta.last_pushed_replay_floor_change_id_hint = replay_floor_change_id;
+                    })
+                    .await?;
+
+                let remote_txns = vec![LogicalTxnData {
+                    end_offset: 64,
+                    commit_ts: 10,
+                    origin_client_id: "remote-client".to_string(),
+                    ops: vec![logical_upsert_row(
+                        "items",
+                        3,
+                        logical_record(&[
+                            turso_core::Value::from_i64(3),
+                            turso_core::Value::from_i64(5),
+                        ]),
+                    )],
+                }];
+                let changes_file = write_logical_txns_file(&io, &changes_path, &remote_txns);
+                let slot = Arc::new(Mutex::new(Some(changes_file)));
+                let file_slot = MutexSlot {
+                    value: slot.lock().unwrap().take().unwrap(),
+                    slot: slot.clone(),
+                };
+                engine
+                    .apply_changes_from_remote(
+                        &coro,
+                        DbChangesStatus {
+                            time: turso_core::WallClockInstant {
+                                secs: 10,
+                                micros: 0,
+                            },
+                            revision: new_revision,
+                            file_slot: Some(file_slot),
+                            stream_kind: DbChangesStreamKind::Logical,
+                        },
+                    )
+                    .await?;
+
+                let conn = engine.connect_rw(&coro).await?;
+                let mut stmt =
+                    conn.prepare("SELECT id, status FROM items WHERE id IN (1, 2, 3) ORDER BY id")?;
+                let mut rows = Vec::new();
+                while let Some(row) = run_stmt_once(&coro, &mut stmt).await? {
+                    let turso_core::Value::Numeric(turso_core::Numeric::Integer(id)) =
+                        row.get_value(0)
+                    else {
+                        panic!("expected integer id");
+                    };
+                    let turso_core::Value::Numeric(turso_core::Numeric::Integer(status)) =
+                        row.get_value(1)
+                    else {
+                        panic!("expected integer status");
+                    };
+                    rows.push((*id, *status));
+                }
+                assert_eq!(rows, vec![(1, 1), (3, 5)]);
+
+                let (_, acknowledged_change_id) =
+                    read_last_change_id(&coro, &conn, &engine.client_unique_id).await?;
+                assert_eq!(
+                    acknowledged_change_id,
+                    Some(original_delete_change_id - 1),
+                    "the original unpushed delete should remain pushable"
+                );
+
+                let mut iterator =
+                    engine
+                        .main_tape
+                        .iterate_changes(DatabaseChangesIteratorOpts {
+                            first_change_id: acknowledged_change_id.map(|change_id| change_id + 1),
+                            mode: DatabaseChangesIteratorMode::Apply,
+                            ignore_schema_changes: true,
+                            ..Default::default()
+                        })?;
+                let mut replayed_item_updates = Vec::new();
+                let mut replayed_item_deletes = Vec::new();
+                while let Some(operation) = iterator.next(&coro).await? {
+                    match operation {
+                        DatabaseTapeOperation::RowChange(change)
+                            if change.table_name == "items" =>
+                        {
+                            match change.change {
+                                DatabaseTapeRowChangeType::Insert { .. }
+                                | DatabaseTapeRowChangeType::Update { .. } => {
+                                    replayed_item_updates.push(change.id);
+                                }
+                                DatabaseTapeRowChangeType::Delete { .. } => {
+                                    replayed_item_deletes.push(change.id);
+                                }
+                            }
+                        }
+                        DatabaseTapeOperation::RowChange(_) | DatabaseTapeOperation::Commit => {}
+                        DatabaseTapeOperation::StmtReplay(_)
+                        | DatabaseTapeOperation::SchemaReplay(_) => {
+                            panic!("changes iterator must not produce replay operations")
+                        }
+                    }
+                }
+                assert!(
+                    !replayed_item_updates.contains(&1),
+                    "already-pushed self change was recaptured into CDC"
+                );
+                assert!(
+                    replayed_item_deletes.contains(&2),
+                    "unpushed local delete was not preserved as pushable"
+                );
                 Result::Ok(())
             }
         });

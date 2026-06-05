@@ -51,8 +51,6 @@ const PULL_UPDATES_PROBE_TIMEOUT: Duration = Duration::from_secs(60);
 const REMOTE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
 const MVCC_LOG_HDR_SIZE: u64 = 56;
 const MVCC_GENERATION_ID_MAX_EXCLUSIVE: u64 = 1_000_000_000_000_000_000;
-const REPLACE_BASE_LOCAL_REPLAY_FAILURE_AFTER_ENV: &str =
-    "TURSO_SYNC_DEBUG_INJECT_REPLACE_BASE_LOCAL_REPLAY_FAILURE_AFTER";
 
 #[derive(Clone)]
 struct Config {
@@ -322,7 +320,7 @@ fn install_rustls_crypto_provider() {
 }
 
 fn init_logging() {
-    let filter = env::var("SYNC_EXAMPLE_LOG")
+    let filter = env::var("SYNC_FUZZER_LOG")
         .ok()
         .or_else(|| env::var("RUST_LOG").ok())
         .unwrap_or_else(|| "warn".to_string());
@@ -355,9 +353,9 @@ async fn run_scripted(config: &Config, protocol: SyncProtocol) -> Result<()> {
     println!("local dir: {}", dir.path().display());
     println!("table: {table}");
 
-    maybe_cleanup_remote_test_tables(&config).await?;
+    maybe_cleanup_remote_test_tables(config).await?;
 
-    let remote_mode = query_remote_journal_mode(&config).await?;
+    let remote_mode = query_remote_journal_mode(config).await?;
     println!("remote journal_mode: {remote_mode}");
     match protocol {
         SyncProtocol::Mvcc if !remote_mode.eq_ignore_ascii_case("mvcc") => {
@@ -390,7 +388,7 @@ async fn run_scripted(config: &Config, protocol: SyncProtocol) -> Result<()> {
     local.db.push().await.context("initial local push failed")?;
 
     let bootstrap = wait_for_local_remote_convergence(
-        &config,
+        config,
         &local,
         &table,
         "bootstrap",
@@ -398,13 +396,13 @@ async fn run_scripted(config: &Config, protocol: SyncProtocol) -> Result<()> {
     )
     .await?;
     print_snapshot("bootstrap snapshot", &bootstrap);
-    assert_scripted_mvcc_incremental_page_pull_is_rejected(&config, &local).await?;
-    assert_scripted_current_generation_logical_pull_after_remote_drop(&config).await?;
-    run_orphan_index_checkpoint_probe(&config, dir.path(), "scripted").await?;
+    assert_scripted_mvcc_incremental_page_pull_is_rejected(config, &local).await?;
+    assert_scripted_current_generation_logical_pull_after_remote_drop(config).await?;
+    run_orphan_index_checkpoint_probe(config, dir.path(), "scripted").await?;
 
     phase_one_local(&local.db, &table).await?;
     let snapshot = wait_for_local_remote_convergence(
-        &config,
+        config,
         &local,
         &table,
         "phase 1 local writes",
@@ -413,9 +411,9 @@ async fn run_scripted(config: &Config, protocol: SyncProtocol) -> Result<()> {
     .await?;
     print_snapshot("phase 1 snapshot", &snapshot);
 
-    phase_two_remote(&config, &table).await?;
+    phase_two_remote(config, &table).await?;
     let snapshot = wait_for_local_remote_convergence(
-        &config,
+        config,
         &local,
         &table,
         "phase 2 remote schema evolution",
@@ -426,7 +424,7 @@ async fn run_scripted(config: &Config, protocol: SyncProtocol) -> Result<()> {
 
     phase_three_local(&local.db, &table).await?;
     let snapshot = wait_for_local_remote_convergence(
-        &config,
+        config,
         &local,
         &table,
         "phase 3 local schema evolution",
@@ -435,9 +433,9 @@ async fn run_scripted(config: &Config, protocol: SyncProtocol) -> Result<()> {
     .await?;
     print_snapshot("phase 3 snapshot", &snapshot);
 
-    phase_four_remote(&config, &table).await?;
+    phase_four_remote(config, &table).await?;
     let snapshot = wait_for_local_remote_convergence(
-        &config,
+        config,
         &local,
         &table,
         "phase 4 remote writes",
@@ -469,7 +467,7 @@ async fn run_scripted(config: &Config, protocol: SyncProtocol) -> Result<()> {
         .context("remote writer worker join failed")??;
 
     let background_snapshot = wait_for_local_remote_convergence(
-        &config,
+        config,
         &local,
         &table,
         "background pressure",
@@ -480,7 +478,7 @@ async fn run_scripted(config: &Config, protocol: SyncProtocol) -> Result<()> {
 
     checkpoint_drill(&local, &table).await?;
     let snapshot = wait_for_local_remote_convergence(
-        &config,
+        config,
         &local,
         &table,
         "checkpoint drill",
@@ -501,7 +499,7 @@ async fn run_scripted(config: &Config, protocol: SyncProtocol) -> Result<()> {
     );
 
     let final_snapshot = wait_for_local_remote_convergence(
-        &config,
+        config,
         &local,
         &table,
         "final drain",
@@ -597,7 +595,7 @@ async fn run_seeded(config: &Config, args: &RunArgs) -> Result<()> {
             .await?;
     }
     let _bootstrap_generation = if args.protocol == SyncProtocol::Mvcc
-        && env_flag_enabled("SYNC_EXAMPLE_FORCE_BOOTSTRAP_ROLLOVER")
+        && env_flag_enabled("SYNC_FUZZER_FORCE_BOOTSTRAP_ROLLOVER")
     {
         let initial_generation = initial_generation.expect("MVCC initial generation must be set");
         let generation = force_remote_generation_rollover_with_push_pressure(
@@ -615,7 +613,7 @@ async fn run_seeded(config: &Config, args: &RunArgs) -> Result<()> {
     } else {
         initial_generation
     };
-    if args.protocol == SyncProtocol::Mvcc && env_flag_enabled("SYNC_EXAMPLE_PROBE_BOOTSTRAP") {
+    if args.protocol == SyncProtocol::Mvcc && env_flag_enabled("SYNC_FUZZER_PROBE_BOOTSTRAP") {
         print_pull_updates_probe(config, "", "seeded bootstrap remote").await;
     }
     replicas.push(primary);
@@ -764,11 +762,11 @@ async fn run_scripted_bug_files_text_pk_secondary_index(
         .db
         .connect()
         .await
-        .context("BUG.md check failed to connect sync-enabled local replica")?;
+        .context("scripted files check failed to connect sync-enabled local replica")?;
     ensure_protocol_mode(&conn, protocol).await?;
     query_rows(&conn, "PRAGMA foreign_keys = ON")
         .await
-        .context("BUG.md check failed to enable foreign keys")?;
+        .context("scripted files check failed to enable foreign keys")?;
     conn.execute(
         "CREATE TABLE IF NOT EXISTS files (
             id TEXT PRIMARY KEY,
@@ -784,13 +782,13 @@ async fn run_scripted_bug_files_text_pk_secondary_index(
         (),
     )
     .await
-    .context("BUG.md check failed to create files table")?;
+    .context("scripted files check failed to create files table")?;
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_files_parent_id ON files (parent_id)",
         (),
     )
     .await
-    .context("BUG.md check failed to create files parent index")?;
+    .context("scripted files check failed to create files parent index")?;
     conn.execute(
         "CREATE TABLE IF NOT EXISTS file_blobs (
             file_id TEXT NOT NULL,
@@ -801,7 +799,7 @@ async fn run_scripted_bug_files_text_pk_secondary_index(
         (),
     )
     .await
-    .context("BUG.md check failed to create file_blobs table")?;
+    .context("scripted files check failed to create file_blobs table")?;
     conn.execute(
         "INSERT INTO files (
             id,
@@ -825,22 +823,22 @@ async fn run_scripted_bug_files_text_pk_secondary_index(
         (),
     )
     .await
-    .context("BUG.md check failed to insert first files row")?;
+    .context("scripted files check failed to insert first files row")?;
     let rows = query_rows(
         &conn,
         "SELECT id, parent_id, filename FROM files ORDER BY id",
     )
     .await
-    .context("BUG.md check failed to read files row")?;
+    .context("scripted files check failed to read files row")?;
     let expected = vec![vec![
         Value::Text("019de3f4-e018-7b33-a58b-6fb14640da4c".to_string()),
         Value::Null,
         Value::Text("interactive-sync.txt".to_string()),
     ]];
     if rows != expected {
-        bail!("BUG.md check inserted unexpected files rows: {rows:?}");
+        bail!("scripted files check inserted unexpected files rows: {rows:?}");
     }
-    println!("scripted check: BUG.md files TEXT PRIMARY KEY insert with secondary index passed");
+    println!("scripted check: files TEXT PRIMARY KEY insert with secondary index passed");
     Ok(())
 }
 
@@ -1461,18 +1459,18 @@ async fn apply_seeded_index_creation(
     let description = match actor {
         SchemaActor::Local(replica_idx) => {
             format!(
-                "{} create quoted index on {}",
-                replicas[replica_idx].name, column
+                "{} create quoted index on {column}",
+                replicas[replica_idx].name
             )
         }
-        SchemaActor::Remote => format!("remote create quoted index on {}", column),
+        SchemaActor::Remote => format!("remote create quoted index on {column}"),
     };
     state.record_note(format!("starting {description}"));
     wait_for_cluster_convergence(
         config,
         replicas,
         &state.table,
-        &format!("create index {}", column),
+        &format!("create index {column}"),
         Some(state),
     )
     .await?;
@@ -2046,15 +2044,12 @@ async fn run_mvcc_legacy_incremental_pull_rejection_check(
             .context("failed to read unexpected legacy MVCC pull response")?;
         let stream_kind = read_probe_stream_kind(&body)?;
         bail!(
-            "MVCC incremental pull without logical_updates unexpectedly succeeded: client_revision={} stream_kind={:?} bytes={}",
-            client_revision,
-            stream_kind,
+            "MVCC incremental pull without logical_updates unexpectedly succeeded: client_revision={client_revision} stream_kind={stream_kind:?} bytes={}",
             body.len(),
         );
     }
     state.record_note(format!(
-        "legacy MVCC incremental pull rejected for revision {}",
-        client_revision
+        "legacy MVCC incremental pull rejected for revision {client_revision}",
     ));
     Ok(())
 }
@@ -2123,7 +2118,7 @@ async fn assert_scripted_mvcc_incremental_page_pull_is_rejected(
 async fn assert_scripted_current_generation_logical_pull_after_remote_drop(
     config: &Config,
 ) -> Result<()> {
-    if env_flag_enabled("SYNC_EXAMPLE_SKIP_CURRENT_DROP_PROBE") {
+    if env_flag_enabled("SYNC_FUZZER_SKIP_CURRENT_DROP_PROBE") {
         println!("scripted note: skipping current-generation logical drop probe by env request");
         return Ok(());
     }
@@ -2153,8 +2148,7 @@ async fn assert_scripted_current_generation_logical_pull_after_remote_drop(
         .await
         .with_context(|| {
             format!(
-                "failed to read post-create revision for current-generation drop probe table {}",
-                table
+                "failed to read post-create revision for current-generation drop probe table {table}"
             )
         })?;
     let client_revision = created_probe.server_revision.clone();
@@ -2173,8 +2167,7 @@ async fn assert_scripted_current_generation_logical_pull_after_remote_drop(
         .await
         .with_context(|| {
             format!(
-                "failed to probe current-generation logical drop from revision {} for {}",
-                client_revision, table
+                "failed to probe current-generation logical drop from revision {client_revision} for {table}"
             )
         })?;
 
@@ -2278,8 +2271,7 @@ async fn run_replace_base_local_preservation_check(
     let current_revision: RichMvccRevision = serde_json::from_str(&current_revision_string)
         .with_context(|| {
             format!(
-                "invalid current replica revision for replace-base preservation check: {}",
-                current_revision_string
+                "invalid current replica revision for replace-base preservation check: {current_revision_string}"
             )
         })?;
     let unavailable_generation = current_revision
@@ -2308,31 +2300,28 @@ async fn run_replace_base_local_preservation_check(
         .await
         .with_context(|| {
             format!(
-                "failed to probe replace-base fallback for unavailable MVCC revision {}",
-                unavailable_revision
+                "failed to probe replace-base fallback for unavailable MVCC revision {unavailable_revision}"
             )
         })?;
     if replace_probe.stream_kind != Some(PullUpdatesStreamKind::Pages) {
         bail!(
-            "expected replace-base fallback to use page stream, got {:?}; client_revision={} server_revision={} apply_mode={:?}",
+            "expected replace-base fallback to use page stream, got {:?}; client_revision={} server_revision={unavailable_revision} apply_mode={:?}",
             replace_probe.stream_kind,
-            unavailable_revision,
             replace_probe.server_revision,
             replace_probe.apply_mode,
         );
     }
     if replace_probe.apply_mode != Some(PullUpdatesApplyMode::ReplaceBase) {
         bail!(
-            "expected replace-base fallback apply_mode=replace_base, got {:?}; client_revision={} server_revision={}",
+            "expected replace-base fallback apply_mode=replace_base, got {:?}; client_revision={unavailable_revision} server_revision={}",
             replace_probe.apply_mode,
-            unavailable_revision,
             replace_probe.server_revision,
         );
     }
     if replace_probe.db_size == 0 {
         bail!(
-            "replace-base fallback returned an empty database size; client_revision={} server_revision={}",
-            unavailable_revision, replace_probe.server_revision,
+            "replace-base fallback returned an empty database size; client_revision={unavailable_revision} server_revision={}",
+            replace_probe.server_revision,
         );
     }
 
@@ -2392,7 +2381,7 @@ async fn run_replace_base_local_preservation_check(
             .await
             .unwrap_or_else(|err| format!("<failed to gather diagnostics: {err:#}>"));
         bail!(
-            "replace-base check did not create pending local CDC changes before injected failure: before={cdc_before_local_changes:?} after={cdc_after_local_changes:?} diagnostics={diagnostics}"
+            "replace-base check did not create pending local CDC changes before replace-base replay: before={cdc_before_local_changes:?} after={cdc_after_local_changes:?} diagnostics={diagnostics}"
         );
     }
     if replayable_after_local_changes == 0 {
@@ -2400,7 +2389,7 @@ async fn run_replace_base_local_preservation_check(
             .await
             .unwrap_or_else(|err| format!("<failed to gather diagnostics: {err:#}>"));
         bail!(
-            "replace-base check has no replayable local CDC changes before injected failure: sync_floor={sync_floor_after_local_changes:?} cdc_before={cdc_before_local_changes:?} cdc_after={cdc_after_local_changes:?} diagnostics={diagnostics}"
+            "replace-base check has no replayable local CDC changes before replace-base replay: sync_floor={sync_floor_after_local_changes:?} cdc_before={cdc_before_local_changes:?} cdc_after={cdc_after_local_changes:?} diagnostics={diagnostics}"
         );
     }
 
@@ -2409,52 +2398,43 @@ async fn run_replace_base_local_preservation_check(
     reopen_replica(config, &mut replica)
         .await
         .context("failed to reopen replica after forcing synthetic stale revision")?;
-    env::set_var(REPLACE_BASE_LOCAL_REPLAY_FAILURE_AFTER_ENV, "0");
-    let failed_pull = replica.db.pull().await;
-    env::remove_var(REPLACE_BASE_LOCAL_REPLAY_FAILURE_AFTER_ENV);
-    let err = failed_pull
-        .err()
-        .with_context(|| {
-            format!(
-                "replace-base injected local replay failure unexpectedly succeeded: sync_floor_before={sync_floor_after_local_changes:?} replayable_before={replayable_after_local_changes} cdc_before={cdc_before_local_changes:?} cdc_after={cdc_after_local_changes:?}"
-            )
-        })?;
-    if !format!("{err:#}").contains("injected replace-base local replay failure") {
-        bail!("replace-base injected failure returned unexpected error: {err:#}");
-    }
-    let revision_after_failure = current_replica_revision(&replica)
+    replica.db.pull().await.with_context(|| {
+        format!(
+            "replace-base pull failed after local changes: sync_floor_before={sync_floor_after_local_changes:?} replayable_before={replayable_after_local_changes} cdc_before={cdc_before_local_changes:?} cdc_after={cdc_after_local_changes:?}"
+        )
+    })?;
+    let revision_after_replay = current_replica_revision(&replica)
         .await
-        .context("failed to read revision after injected replace-base failure")?;
-    if revision_after_failure != unavailable_revision {
+        .context("failed to read revision after replace-base local replay")?;
+    if revision_after_replay == unavailable_revision {
         bail!(
-            "replace-base injected failure advanced synced revision unexpectedly: before={} after={}",
+            "replace-base local replay did not advance synced revision: before={} after={}",
             unavailable_revision,
-            revision_after_failure
+            revision_after_replay
         );
     }
     if replica_replace_base_marker_path(&replica).exists() {
         bail!(
-            "replace-base recovery marker still exists after injected failure restore: {}",
+            "replace-base recovery marker still exists after successful local replay: {}",
             replica_replace_base_marker_path(&replica).display()
         );
     }
 
     reopen_replica(config, &mut replica)
         .await
-        .context("failed to reopen replica after injected replace-base failure")?;
+        .context("failed to reopen replica after replace-base local replay")?;
     assert_replace_base_local_rows(
         &replica,
         &state.table,
         local_insert_id,
         local_update_id,
         local_delete_id,
-        "after injected replace-base failure restore",
+        "after replace-base local replay",
     )
     .await?;
 
     state.record_note(format!(
-        "verified replace-base injected replay failure restore plus local insert/update/delete preservation from synthetic revision {}",
-        unavailable_revision
+        "verified replace-base local insert/update/delete preservation from synthetic revision {unavailable_revision}"
     ));
     Ok(())
 }
@@ -2580,8 +2560,7 @@ async fn run_incremental_logical_stream_check(
     assert_probe_has_row_upsert(&probe, &state.table, remote_id)?;
 
     state.record_note(format!(
-        "incremental logical probe succeeded for {} with remote id {}",
-        replica_name, remote_id
+        "incremental logical probe succeeded for {replica_name} with remote id {remote_id}"
     ));
     Ok(())
 }
@@ -2638,9 +2617,8 @@ async fn run_quoted_identifier_logical_stream_check(
             return Ok(());
         }
         bail!(
-            "expected logical pull-updates stream for quoted identifier check, got {:?}; client_revision={} server_revision={}",
+            "expected logical pull-updates stream for quoted identifier check, got {:?}; client_revision={client_revision} server_revision={}",
             probe.stream_kind,
-            client_revision,
             probe.server_revision,
         );
     }
@@ -2652,8 +2630,7 @@ async fn run_quoted_identifier_logical_stream_check(
     )
     .await?;
     state.record_note(format!(
-        "quoted identifier logical probe succeeded for {}",
-        quoted_table
+        "quoted identifier logical probe succeeded for {quoted_table}",
     ));
     Ok(())
 }
@@ -2778,8 +2755,7 @@ async fn run_mixed_transaction_logical_stream_check(
             )
             .await?;
             state.record_note(format!(
-                "remote mixed DDL/data logical transaction inserted id {}",
-                insert_id
+                "remote mixed DDL/data logical transaction inserted id {insert_id}"
             ));
             insert_id
         }
@@ -2922,8 +2898,7 @@ async fn run_generation_rollover_logical_recovery_check(
     )
     .await?;
     state.record_note(format!(
-        "remote generation advanced from {} to {}",
-        previous_generation, next_generation
+        "remote generation advanced from {previous_generation} to {next_generation}"
     ));
 
     let after_checkpoint_id = state.next_remote_insert_id();
@@ -2995,8 +2970,7 @@ async fn run_generation_rollover_logical_recovery_check(
     .await?;
     print_compact_snapshot("generation rollover recovery", &recovered_snapshot);
     state.record_note(format!(
-        "{} recovered across generation {} -> {} via logical pull-updates",
-        replica_name, previous_generation, next_generation
+        "{replica_name} recovered across generation {previous_generation} -> {next_generation} via logical pull-updates",
     ));
 
     Ok(())
@@ -3266,7 +3240,7 @@ async fn assert_cluster_integrity(
 }
 
 async fn pause_after_integrity_failure_if_requested() {
-    if env_flag_enabled("SYNC_EXAMPLE_PAUSE_ON_INTEGRITY_FAILURE") {
+    if env_flag_enabled("SYNC_FUZZER_PAUSE_ON_INTEGRITY_FAILURE") {
         eprintln!(
             "pausing after integrity failure; inspect the local dir before killing the process"
         );
@@ -3440,6 +3414,7 @@ fn mvcc_revision_is_older_than(current: MvccRevision, previous: MvccRevision) ->
     current.log_offset < previous.log_offset
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn print_idempotence_diagnostics(
     config: &Config,
     replicas: &mut [LocalReplica],
@@ -3493,14 +3468,9 @@ async fn print_idempotence_diagnostics(
         Err(err) => eprintln!("failed to fetch remote sqlite_schema rows: {err:#}"),
     }
 
-    for idx in 0..replicas.len() {
-        if let Err(err) =
-            print_replica_idempotence_summary(&mut replicas[idx], table, idx == failing_idx).await
-        {
-            eprintln!(
-                "failed to gather diagnostics for {}: {err:#}",
-                replicas[idx].name
-            );
+    for (idx, rep) in replicas.iter_mut().enumerate() {
+        if let Err(err) = print_replica_idempotence_summary(rep, table, idx == failing_idx).await {
+            eprintln!("failed to gather diagnostics for {}: {err:#}", rep.name);
         }
     }
 
@@ -4113,7 +4083,7 @@ fn load_config() -> Result<Config> {
         .filter(|key| !key.is_empty());
     let remote_encryption_cipher = if remote_encryption_key.is_none() {
         None
-    } else if let Some(cipher) = env::var("TURSO_REMOTE_ENCRYPTION_CIPHER").ok() {
+    } else if let Ok(cipher) = env::var("TURSO_REMOTE_ENCRYPTION_CIPHER") {
         Some(
             cipher
                 .parse()
@@ -5024,7 +4994,7 @@ async fn query_remote_journal_mode(config: &Config) -> Result<String> {
 }
 
 async fn maybe_cleanup_remote_test_tables(config: &Config) -> Result<()> {
-    if !env_flag_enabled("SYNC_EXAMPLE_CLEANUP_REMOTE") {
+    if !env_flag_enabled("SYNC_FUZZER_CLEANUP_REMOTE") {
         return Ok(());
     }
 
@@ -5032,8 +5002,7 @@ async fn maybe_cleanup_remote_test_tables(config: &Config) -> Result<()> {
         Ok(result) => result,
         Err(_) => {
             eprintln!(
-                "[sync-debug] remote cleanup timed out after {:?}; continuing with unique fuzzer table",
-                REMOTE_CLEANUP_TIMEOUT
+                "[sync-debug] remote cleanup timed out after {REMOTE_CLEANUP_TIMEOUT:?}; continuing with unique fuzzer table"
             );
             Ok(())
         }
@@ -5175,8 +5144,7 @@ async fn force_remote_generation_rollover_with_push_pressure(
             .await
             .with_context(|| {
                 format!(
-                    "failed to write generation pressure row attempt={} batch={} id={id}",
-                    attempt, batch
+                    "failed to write generation pressure row attempt={attempt} batch={batch} id={id}"
                 )
             })?;
         }
@@ -5205,8 +5173,7 @@ async fn force_remote_generation_rollover_with_push_pressure(
             let current_generation = query_remote_generation(config).await?;
             if current_generation != previous_generation {
                 println!(
-                    "generation rollover via push pressure: label={} previous_generation={} current_generation={} attempt={}",
-                    label, previous_generation, current_generation, attempt
+                    "generation rollover via push pressure: label={label} previous_generation={previous_generation} current_generation={current_generation} attempt={attempt}"
                 );
                 return Ok(current_generation);
             }
@@ -5421,8 +5388,7 @@ async fn print_pull_updates_probe(
     match probe_pull_updates_stream(config, client_revision).await {
         Ok(probe) => {
             eprintln!(
-                "pull-updates probe for {label}: client_revision={} server_revision={} db_size={} stream_kind={:?} apply_mode={:?} trailing_messages={} raw_logical_bytes={}",
-                client_revision,
+                "pull-updates probe for {label}: client_revision={client_revision} server_revision={} db_size={} stream_kind={:?} apply_mode={:?} trailing_messages={} raw_logical_bytes={}",
                 probe.server_revision,
                 probe.db_size,
                 probe.stream_kind,
@@ -5434,8 +5400,7 @@ async fn print_pull_updates_probe(
         }
         Err(err) => {
             eprintln!(
-                "pull-updates probe for {label} failed: client_revision={} err={:#}",
-                client_revision, err
+                "pull-updates probe for {label} failed: client_revision={client_revision} err={err:#}",
             );
             None
         }

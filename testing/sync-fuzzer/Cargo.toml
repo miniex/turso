@@ -1,5 +1,5 @@
 [package]
-name = "turso-sync-engine-examples"
+name = "turso-sync-fuzzer"
 version = "0.1.0"
 edition = "2021"
 publish = false

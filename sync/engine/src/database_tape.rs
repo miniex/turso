@@ -893,8 +893,7 @@ impl DatabaseReplaySession {
                             .await
                             .map_err(|err| {
                                 Error::DatabaseTapeError(format!(
-                                    "failed to replay schema DDL `{}`: {}",
-                                    sql, err
+                                    "failed to replay schema DDL `{sql}`: {err}"
                                 ))
                             })?;
                     }
@@ -909,8 +908,7 @@ impl DatabaseReplaySession {
                             .await
                             .map_err(|err| {
                                 Error::DatabaseTapeError(format!(
-                                    "failed to replay schema refresh DDL `{}`: {}",
-                                    sql, err
+                                    "failed to replay schema refresh DDL `{sql}`: {err}"
                                 ))
                             })?;
                     }
@@ -2682,6 +2680,155 @@ mod tests {
                             turso_core::Value::Text(turso_core::types::Text::new("beta")),
                             turso_core::Value::Text(turso_core::types::Text::new("b-extra")),
                         ],
+                    ]
+                );
+                crate::Result::Ok(())
+            }
+        });
+        loop {
+            match gen.resume_with(Ok(())) {
+                genawaiter::GeneratorState::Yielded(..) => io.step().unwrap(),
+                genawaiter::GeneratorState::Complete(result) => {
+                    result.unwrap();
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Post-ALTER UPDATE with an INTEGER PRIMARY KEY and several added columns.
+    ///
+    /// Replaying a CDC update captured after multiple ADD COLUMN statements must
+    /// update the target's trailing columns, not just the pre-ALTER prefix.
+    #[test]
+    pub fn test_database_tape_replay_post_alter_integer_pk_update_trailing_column() {
+        let temp_file1 = NamedTempFile::new().unwrap();
+        let db_path1 = temp_file1.path().to_str().unwrap();
+        let temp_file2 = NamedTempFile::new().unwrap();
+        let db_path2 = temp_file2.path().to_str().unwrap();
+
+        let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+
+        let db1 = turso_core::Database::open_file(io.clone(), db_path1).unwrap();
+        let db1 = Arc::new(DatabaseTape::new(db1));
+
+        let db2 = turso_core::Database::open_file(io.clone(), db_path2).unwrap();
+        let db2 = Arc::new(DatabaseTape::new(db2));
+
+        let mut gen = genawaiter::sync::Gen::new({
+            |coro| async move {
+                let coro: Coro<()> = coro.into();
+                let conn1 = db1.connect(&coro).await.unwrap();
+                conn1
+                    .execute(
+                        "CREATE TABLE t(
+                            id INTEGER PRIMARY KEY,
+                            owner TEXT NOT NULL,
+                            payload TEXT NOT NULL,
+                            rev INTEGER NOT NULL DEFAULT 0
+                        )",
+                    )
+                    .unwrap();
+                conn1
+                    .execute("CREATE INDEX \"t owner rev idx\" ON t(owner, rev)")
+                    .unwrap();
+                conn1
+                    .execute(
+                        "INSERT INTO t(id, owner, payload, rev)
+                         VALUES (100, 'local-owner', 'initial-payload', 1)",
+                    )
+                    .unwrap();
+                conn1.execute("ALTER TABLE t ADD COLUMN note TEXT").unwrap();
+                conn1.execute("UPDATE t SET note = 'schema-note'").unwrap();
+                conn1
+                    .execute("ALTER TABLE t ADD COLUMN bucket INTEGER NOT NULL DEFAULT 0")
+                    .unwrap();
+                conn1.execute("UPDATE t SET bucket = 1").unwrap();
+                conn1.execute("ALTER TABLE t ADD COLUMN tag TEXT").unwrap();
+                conn1.execute("UPDATE t SET tag = 'tag-0'").unwrap();
+                conn1
+                    .execute("ALTER TABLE t ADD COLUMN status INTEGER NOT NULL DEFAULT 0")
+                    .unwrap();
+                conn1.execute("UPDATE t SET status = 1").unwrap();
+
+                let baseline_change_id = {
+                    let mut stmt = conn1
+                        .prepare(
+                            "SELECT MAX(change_id) FROM turso_cdc
+                             WHERE change_type != 2 AND table_name = 't'",
+                        )
+                        .unwrap();
+                    let row = run_stmt_once(&coro, &mut stmt).await.unwrap().unwrap();
+                    row.get_value(0).as_int().unwrap()
+                };
+
+                conn1
+                    .execute(
+                        "UPDATE t SET
+                            payload = 'updated-payload',
+                            rev = rev + 1,
+                            note = 'updated-note',
+                            bucket = 15,
+                            tag = 'updated-tag',
+                            status = 3
+                         WHERE id = 100",
+                    )
+                    .unwrap();
+
+                let conn2 = db2.connect_untracked().unwrap();
+                conn2
+                    .execute(
+                        "CREATE TABLE t(
+                            id INTEGER PRIMARY KEY,
+                            owner TEXT NOT NULL,
+                            payload TEXT NOT NULL,
+                            rev INTEGER NOT NULL DEFAULT 0,
+                            note TEXT,
+                            bucket INTEGER NOT NULL DEFAULT 0,
+                            tag TEXT,
+                            status INTEGER NOT NULL DEFAULT 0
+                        )",
+                    )
+                    .unwrap();
+                conn2
+                    .execute(
+                        "INSERT INTO t(id, owner, payload, rev, note, bucket, tag, status)
+                         VALUES (100, 'local-owner', 'initial-payload', 1, 'schema-note', 1, 'tag-0', 1)",
+                    )
+                    .unwrap();
+
+                let _conn2_tracked = db2.connect(&coro).await.unwrap();
+                {
+                    let opts = DatabaseReplaySessionOpts {
+                        use_implicit_rowid: false,
+                    };
+                    let mut session = db2.start_replay_session(&coro, opts).await.unwrap();
+
+                    let opts = DatabaseChangesIteratorOpts {
+                        first_change_id: Some(baseline_change_id + 1),
+                        ignore_schema_changes: true,
+                        ..Default::default()
+                    };
+                    let mut iterator = db1.iterate_changes(opts).unwrap();
+                    while let Some(operation) = iterator.next(&coro).await.unwrap() {
+                        session.replay(&coro, operation).await.unwrap();
+                    }
+                }
+
+                let mut stmt = conn2
+                    .prepare("SELECT payload, rev, note, bucket, tag, status FROM t WHERE id = 100")
+                    .unwrap();
+                let row = run_stmt_once(&coro, &mut stmt).await.unwrap().unwrap();
+                let values = row.get_values().cloned().collect::<Vec<_>>();
+                assert_eq!(
+                    values,
+                    vec![
+                        turso_core::Value::Text(turso_core::types::Text::new("updated-payload")),
+                        turso_core::Value::from_i64(2),
+                        turso_core::Value::Text(turso_core::types::Text::new("updated-note")),
+                        turso_core::Value::from_i64(15),
+                        turso_core::Value::Text(turso_core::types::Text::new("updated-tag")),
+                        turso_core::Value::from_i64(3),
                     ]
                 );
                 crate::Result::Ok(())
