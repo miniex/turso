@@ -33,6 +33,7 @@ const DEFAULT_CDC_TABLE_NAME: &str = "turso_cdc";
 const DEFAULT_CDC_MODE: &str = "full";
 const DEFAULT_CHANGES_BATCH_SIZE: usize = 100;
 const TURSO_CDC_VERSION_TABLE_NAME: &str = "turso_cdc_version";
+const SQLITE_INTERNAL_PREFIX: &str = "sqlite_";
 const TURSO_INTERNAL_PREFIX: &str = "__turso_internal_";
 const TURSO_SYNC_TABLE_NAME: &str = "turso_sync_last_change_id";
 pub const CDC_PRAGMA_NAME: &str = "capture_data_changes_conn";
@@ -732,7 +733,8 @@ fn sqlite_schema_record_name(record: &[turso_core::Value]) -> Result<Option<&str
 }
 
 fn is_tape_replayable_object(name: &str, cdc_table: &str) -> bool {
-    !name.starts_with(TURSO_INTERNAL_PREFIX)
+    !name.starts_with(SQLITE_INTERNAL_PREFIX)
+        && !name.starts_with(TURSO_INTERNAL_PREFIX)
         && name != TURSO_SYNC_TABLE_NAME
         && name != cdc_table
         && name != TURSO_CDC_VERSION_TABLE_NAME
@@ -1155,10 +1157,33 @@ mod tests {
 
     use crate::{
         database_tape::{
-            run_stmt_once, DatabaseChangesIteratorOpts, DatabaseReplaySessionOpts, DatabaseTape,
+            is_tape_replayable_object, run_stmt_once, DatabaseChangesIteratorOpts,
+            DatabaseReplaySessionOpts, DatabaseTape,
         },
         types::{Coro, DatabaseTapeOperation, DatabaseTapeRowChange, DatabaseTapeRowChangeType},
     };
+
+    #[test]
+    pub fn test_database_tape_filters_internal_schema_objects() {
+        assert!(is_tape_replayable_object("user_table", "turso_cdc"));
+        assert!(is_tape_replayable_object("user_index", "turso_cdc"));
+
+        assert!(!is_tape_replayable_object("sqlite_sequence", "turso_cdc"));
+        assert!(!is_tape_replayable_object(
+            "sqlite_autoindex_user_table_1",
+            "turso_cdc"
+        ));
+        assert!(!is_tape_replayable_object(
+            "__turso_internal_seq___turso_internal_autoincrement_turso_cdc",
+            "turso_cdc"
+        ));
+        assert!(!is_tape_replayable_object("turso_cdc", "turso_cdc"));
+        assert!(!is_tape_replayable_object("turso_cdc_version", "turso_cdc"));
+        assert!(!is_tape_replayable_object(
+            "turso_sync_last_change_id",
+            "turso_cdc"
+        ));
+    }
 
     #[test]
     pub fn test_database_tape_connect() {
