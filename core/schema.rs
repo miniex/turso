@@ -1361,9 +1361,15 @@ impl Schema {
 
     #[cfg(feature = "conn_raw_api")]
     pub fn table_name_for_root_page(&self, root_page: i64) -> Option<&str> {
-        self.table_names_by_root_page
-            .get(&root_page)
-            .map(String::as_str)
+        if let Some(name) = self.table_names_by_root_page.get(&root_page) {
+            return Some(name.as_str());
+        }
+        self.tables
+            .iter()
+            .find_map(|(name, table)| match table.as_ref() {
+                Table::BTree(table) if table.root_page == root_page => Some(name.as_str()),
+                _ => None,
+            })
     }
 
     pub fn remove_table(&mut self, table_name: &str) {
@@ -6478,6 +6484,18 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("generated columns"));
+    }
+
+    #[cfg(feature = "conn_raw_api")]
+    #[test]
+    fn test_table_name_for_root_page_falls_back_to_tables_map() -> Result<()> {
+        let mut schema = Schema::new();
+        let table = BTreeTable::from_sql("CREATE TABLE items(id INTEGER PRIMARY KEY)", 42)?;
+        schema.add_btree_table(Arc::new(table))?;
+        schema.table_names_by_root_page.remove(&42);
+
+        assert_eq!(schema.table_name_for_root_page(42), Some("items"));
+        Ok(())
     }
 
     fn indices(mask: &ColumnMask) -> Vec<usize> {
