@@ -12305,6 +12305,105 @@ fn test_mvcc_portable_changes_emit_index_drop_for_drop_table() {
 
 #[cfg(feature = "conn_raw_api")]
 #[test]
+fn test_mvcc_portable_changes_ignore_sqlite_sequence_writes() {
+    let db = MvccTestDb::new_with_portable_logical_changes();
+    db.conn
+        .execute("CREATE TABLE items(id INTEGER PRIMARY KEY AUTOINCREMENT, payload TEXT)")
+        .unwrap();
+    db.conn
+        .execute("INSERT INTO items(payload) VALUES ('alpha')")
+        .unwrap();
+
+    let portable_changes = collect_mvcc_portable_change_bytes(&db.conn);
+    let txns = decode_portable_change_txns(&portable_changes);
+    let objects = decoded_object_maps(&txns);
+
+    assert!(objects.iter().any(|object| object.name == "items"));
+    assert!(!objects
+        .iter()
+        .any(|object| object.name == "sqlite_sequence"));
+    assert!(!bytes_contain(&portable_changes, b"sqlite_sequence"));
+}
+
+#[cfg(feature = "conn_raw_api")]
+#[test]
+fn test_mvcc_portable_changes_ignore_sync_cdc_autoincrement_writes() {
+    let db = MvccTestDb::new_with_portable_logical_changes();
+    db.conn
+        .execute("CREATE TABLE turso_cdc(id INTEGER PRIMARY KEY AUTOINCREMENT, payload TEXT)")
+        .unwrap();
+    db.conn
+        .execute("INSERT INTO turso_cdc(payload) VALUES ('internal-change')")
+        .unwrap();
+
+    let portable_changes = collect_mvcc_portable_change_bytes(&db.conn);
+    let txns = decode_portable_change_txns(&portable_changes);
+    let objects = decoded_object_maps(&txns);
+
+    assert!(objects.is_empty());
+    assert!(!bytes_contain(&portable_changes, b"turso_cdc"));
+    assert!(!bytes_contain(&portable_changes, b"sqlite_sequence"));
+}
+
+#[cfg(feature = "conn_raw_api")]
+#[test]
+fn test_mvcc_portable_changes_ignore_checkpointed_sync_cdc_autoincrement_writes() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    {
+        let conn = db.get_db().connect().unwrap();
+        conn.set_portable_logical_changes_enabled(true);
+        conn.execute("CREATE TABLE turso_cdc(id INTEGER PRIMARY KEY AUTOINCREMENT, payload TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO turso_cdc(payload) VALUES ('before-restart')")
+            .unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.close().unwrap();
+    }
+
+    db.restart();
+
+    let conn = db.get_db().connect().unwrap();
+    conn.set_portable_logical_changes_enabled(true);
+    conn.execute("INSERT INTO turso_cdc(payload) VALUES ('after-restart')")
+        .unwrap();
+
+    let portable_changes = collect_mvcc_portable_change_bytes(&conn);
+    let txns = decode_portable_change_txns(&portable_changes);
+    let objects = decoded_object_maps(&txns);
+
+    assert!(objects.is_empty());
+    assert!(!bytes_contain(&portable_changes, b"turso_cdc"));
+    assert!(!bytes_contain(&portable_changes, b"sqlite_sequence"));
+}
+
+#[cfg(feature = "conn_raw_api")]
+#[test]
+fn test_mvcc_portable_changes_resolve_name_from_mvcc_schema_rows() {
+    let db = MvccTestDb::new_with_portable_logical_changes();
+    db.conn
+        .execute("CREATE TABLE items(id INTEGER PRIMARY KEY, payload TEXT)")
+        .unwrap();
+    let mut rootpage = None;
+    let mut stmt = db
+        .conn
+        .query("SELECT rootpage FROM sqlite_schema WHERE name = 'items'")
+        .unwrap()
+        .unwrap();
+    stmt.run_with_row_callback(|row| {
+        rootpage = Some(row.get::<i64>(0)?);
+        Ok(())
+    })
+    .unwrap();
+    let rootpage = rootpage.unwrap();
+
+    assert_eq!(
+        table_name_for_rootpage_in_mvcc_schema(&db.mvcc_store, rootpage).as_deref(),
+        Some("items")
+    );
+}
+
+#[cfg(feature = "conn_raw_api")]
+#[test]
 fn test_mvcc_portable_changes_resolve_table_after_alter_backfill() {
     let db = MvccTestDb::new_with_portable_logical_changes();
     db.conn

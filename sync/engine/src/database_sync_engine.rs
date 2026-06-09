@@ -1,14 +1,12 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc, Mutex, RwLock,
     },
 };
 
-use turso_core::{
-    Buffer, Completion, DatabaseStorage, LimboError, OpenDbAsyncState, OpenFlags, Value,
-};
+use turso_core::{Buffer, Completion, DatabaseStorage, LimboError, OpenDbAsyncState, OpenFlags};
 
 use crate::{
     database_replay_generator::DatabaseReplayGenerator,
@@ -25,9 +23,9 @@ use crate::{
         WAL_FRAME_SIZE,
     },
     database_tape::{
-        run_stmt_once, DatabaseChangesIteratorMode, DatabaseChangesIteratorOpts,
-        DatabaseReplaySession, DatabaseReplaySessionOpts, DatabaseTape, DatabaseTapeOpts,
-        DatabaseWalSession, CDC_PRAGMA_NAME,
+        DatabaseChangesIteratorMode, DatabaseChangesIteratorOpts, DatabaseReplaySession,
+        DatabaseReplaySessionOpts, DatabaseTape, DatabaseTapeOpts, DatabaseWalSession,
+        CDC_PRAGMA_NAME,
     },
     errors::Error,
     io_operations::IoOperations,
@@ -505,38 +503,6 @@ fn use_pushed_change_hint_for_local_replay(stream_kind: DbChangesStreamKind) -> 
 
 fn use_pushed_replay_floor_hint_for_local_replay(stream_kind: DbChangesStreamKind) -> bool {
     matches!(stream_kind, DbChangesStreamKind::Logical)
-}
-
-fn quote_sync_ident(name: &str) -> String {
-    format!("\"{}\"", name.replace('"', "\"\""))
-}
-
-async fn rowid_exists_after_remote_apply<Ctx>(
-    coro: &Coro<Ctx>,
-    conn: &Arc<turso_core::Connection>,
-    change: &DatabaseTapeRowChange,
-) -> Result<bool> {
-    if !is_logically_replayable_table(&change.table_name) {
-        return Ok(false);
-    }
-
-    let sql = format!(
-        "SELECT 1 FROM {} WHERE rowid = ? LIMIT 1",
-        quote_sync_ident(&change.table_name)
-    );
-    let mut stmt = match conn.prepare(sql) {
-        Ok(stmt) => stmt,
-        Err(error) => {
-            tracing::debug!(
-                "rowid_exists_after_remote_apply: unable to prepare row lookup for table={} rowid={}: {error}",
-                change.table_name,
-                change.id
-            );
-            return Ok(false);
-        }
-    };
-    stmt.bind_at(1.try_into().unwrap(), Value::from_i64(change.id))?;
-    Ok(run_stmt_once(coro, &mut stmt).await?.is_some())
 }
 
 /// Returns true for pull-update streams that physically install remote pages.
@@ -2119,7 +2085,6 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
 
             // Phase 2: after revert DB has no local changes in its latest state - so its safe to apply changes from remote
             let mut logical_replay_conn = None;
-            let mut remote_touched_rows = BTreeSet::new();
             let mut applied_raw_db_size = 0;
             match stream_kind {
             stream_kind if stream_kind_applies_remote_pages(stream_kind) => {
@@ -2312,11 +2277,10 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                         "failed to apply remote logical transactions: {error}",
                     ))
                 })?;
-                remote_touched_rows = replay_stats.touched_rows;
                 tracing::info!(
                     "apply_changes(path={}): applied logical transactions from remote file; touched_rows={}",
                     self.main_db_path,
-                    remote_touched_rows.len(),
+                    replay_stats.touched_rows.len(),
                 );
                 logical_replay_conn = Some(conn);
             }
@@ -2478,55 +2442,6 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             && last_pushed_change_id_hint > 0
             && last_pushed_replay_floor_change_id_hint < last_pushed_change_id_hint
             && replay_floor == last_pushed_replay_floor_change_id_hint;
-        let local_changes = if replaying_pushed_self_range && !remote_touched_rows.is_empty() {
-            let mut filtered = Vec::with_capacity(local_changes.len());
-            let mut skipped = 0usize;
-            for change in local_changes {
-                let pushed_self_upsert = change.change_id <= last_pushed_change_id_hint
-                    && !matches!(change.change, DatabaseTapeRowChangeType::Delete { .. });
-                let row_key = (change.table_name.clone(), change.id);
-                if pushed_self_upsert && remote_touched_rows.contains(&row_key) {
-                    skipped += 1;
-                    continue;
-                }
-                filtered.push(change);
-            }
-            if skipped > 0 {
-                tracing::info!(
-                    "apply_changes(path={}): skipped {} pushed local changes covered by remote logical row ops",
-                    self.main_db_path,
-                    skipped,
-                );
-            }
-            filtered
-        } else {
-            local_changes
-        };
-        let local_changes = if replaying_pushed_self_range {
-            let mut filtered = Vec::with_capacity(local_changes.len());
-            let mut skipped = 0usize;
-            for change in local_changes {
-                let pushed_self_insert = change.change_id <= last_pushed_change_id_hint
-                    && matches!(change.change, DatabaseTapeRowChangeType::Insert { .. });
-                if pushed_self_insert
-                    && rowid_exists_after_remote_apply(coro, phase_conn, &change).await?
-                {
-                    skipped += 1;
-                    continue;
-                }
-                filtered.push(change);
-            }
-            if skipped > 0 {
-                tracing::info!(
-                    "apply_changes(path={}): skipped {} pushed local inserts already present after remote apply",
-                    self.main_db_path,
-                    skipped,
-                );
-            }
-            filtered
-        } else {
-            local_changes
-        };
         let replayed_local_changes = !local_changes.is_empty();
         let delay_cdc_for_pushed_self_replay = logical_replay_conn.is_some()
             && replaying_pushed_self_range
@@ -3022,8 +2937,9 @@ mod tests {
         database_tape::{run_stmt_once, DatabaseChangesIteratorMode, DatabaseChangesIteratorOpts},
         io_operations::IoOperations,
         server_proto::{
-            LogicalOp, LogicalOpType, LogicalTxnData, PullUpdatesApplyMode,
-            PullUpdatesReqProtoBody, PullUpdatesRespProtoBody, PullUpdatesStreamKind,
+            LogicalOp, LogicalOpType, LogicalSchemaAction, LogicalSchemaKind, LogicalTxnData,
+            PullUpdatesApplyMode, PullUpdatesReqProtoBody, PullUpdatesRespProtoBody,
+            PullUpdatesStreamKind,
         },
         types::{
             Coro, DatabaseMetadata, DatabasePullRevision, DatabaseRowMutation,
@@ -3275,6 +3191,22 @@ mod tests {
             schema_action: None,
             schema_kind: None,
             schema_name: String::new(),
+            stable_table_id: 0,
+        }
+    }
+
+    fn logical_schema_alter(table_name: &str, sql: &str) -> LogicalOp {
+        LogicalOp {
+            op_type: LogicalOpType::Schema as i32,
+            table_name: String::new(),
+            rowid: 0,
+            record: Bytes::new(),
+            sql: sql.to_string(),
+            user_version: None,
+            application_id: None,
+            schema_action: Some(LogicalSchemaAction::Alter as i32),
+            schema_kind: Some(LogicalSchemaKind::Table as i32),
+            schema_name: table_name.to_string(),
             stable_table_id: 0,
         }
     }
@@ -4310,6 +4242,132 @@ mod tests {
                     replayed_item_deletes.contains(&2),
                     "unpushed local delete was not preserved as pushable"
                 );
+                Result::Ok(())
+            }
+        });
+
+        loop {
+            match gen.resume_with(Ok(())) {
+                genawaiter::GeneratorState::Yielded(..) => io.step().unwrap(),
+                genawaiter::GeneratorState::Complete(result) => {
+                    result.unwrap();
+                    break;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn logical_replay_replays_pushed_self_update_after_remote_backfill_touches_same_row() {
+        let main_file = NamedTempFile::new().unwrap();
+        let changes_file = NamedTempFile::new().unwrap();
+        let main_path = main_file.path().to_str().unwrap().to_string();
+        let changes_path = changes_file.path().to_str().unwrap().to_string();
+
+        let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let sync_engine_io = SyncEngineIoStats::new(Arc::new(NoopSyncEngineIo));
+        let new_revision = DatabasePullRevision::V1 {
+            revision: "logical-revision-after-backfill".to_string(),
+        };
+
+        let mut gen = genawaiter::sync::Gen::new({
+            let io = io.clone();
+            let sync_engine_io = sync_engine_io.clone();
+            let main_path = main_path.clone();
+            let changes_path = changes_path.clone();
+            let new_revision = new_revision.clone();
+            move |coro| async move {
+                let coro: Coro<()> = coro.into();
+                let engine = DatabaseSyncEngine::create_db(
+                    &coro,
+                    io.clone(),
+                    sync_engine_io.clone(),
+                    &main_path,
+                    default_test_opts(),
+                )
+                .await?;
+                let conn = engine.connect_rw(&coro).await?;
+                conn.execute("PRAGMA journal_mode = 'mvcc'")?;
+                conn.execute("CREATE TABLE items(id INTEGER PRIMARY KEY, value TEXT, note TEXT)")?;
+                conn.execute("INSERT INTO items VALUES (1, 'seed', 'seed-note')")?;
+                let replay_floor_change_id = max_local_change_id(&coro, &conn).await?.unwrap_or(0);
+                update_last_change_id(
+                    &coro,
+                    &conn,
+                    &engine.client_unique_id,
+                    5,
+                    replay_floor_change_id,
+                )
+                .await?;
+                conn.checkpoint(CheckpointMode::Truncate {
+                    upper_bound_inclusive: None,
+                })?;
+
+                conn.execute(
+                    "UPDATE items SET value = 'local-pushed', note = 'local-note' WHERE id = 1",
+                )?;
+                let pushed_change_id = max_local_change_id(&coro, &conn).await?.unwrap_or(0);
+                update_last_change_id(&coro, &conn, &engine.client_unique_id, 5, pushed_change_id)
+                    .await?;
+                drop(conn);
+
+                engine
+                    .update_meta(&coro, |meta| {
+                        meta.last_pushed_pull_gen_hint = 5;
+                        meta.last_pushed_change_id_hint = pushed_change_id;
+                        meta.last_pushed_replay_floor_change_id_hint = replay_floor_change_id;
+                    })
+                    .await?;
+
+                let remote_txns = vec![LogicalTxnData {
+                    end_offset: 64,
+                    commit_ts: 10,
+                    origin_client_id: "remote-client".to_string(),
+                    ops: vec![
+                        logical_schema_alter(
+                            "items",
+                            "ALTER TABLE items ADD COLUMN bucket INTEGER NOT NULL DEFAULT 0",
+                        ),
+                        logical_upsert_row(
+                            "items",
+                            1,
+                            logical_record(&[
+                                turso_core::Value::from_i64(1),
+                                turso_core::Value::build_text("seed"),
+                                turso_core::Value::build_text("seed-note"),
+                                turso_core::Value::from_i64(1),
+                            ]),
+                        ),
+                    ],
+                }];
+                let changes_file = write_logical_txns_file(&io, &changes_path, &remote_txns);
+                let slot = Arc::new(Mutex::new(Some(changes_file)));
+                let file_slot = MutexSlot {
+                    value: slot.lock().unwrap().take().unwrap(),
+                    slot: slot.clone(),
+                };
+                engine
+                    .apply_changes_from_remote(
+                        &coro,
+                        DbChangesStatus {
+                            time: turso_core::WallClockInstant {
+                                secs: 10,
+                                micros: 0,
+                            },
+                            revision: new_revision,
+                            file_slot: Some(file_slot),
+                            stream_kind: DbChangesStreamKind::Logical,
+                        },
+                    )
+                    .await?;
+
+                let conn = engine.connect_rw(&coro).await?;
+                let mut stmt =
+                    conn.prepare("SELECT value, note, bucket FROM items WHERE id = 1")?;
+                let row = run_stmt_once(&coro, &mut stmt).await?.unwrap();
+                assert_eq!(row.get_value(0).to_text().unwrap(), "local-pushed");
+                assert_eq!(row.get_value(1).to_text().unwrap(), "local-note");
+                assert_eq!(row.get_value(2).as_int().unwrap(), 1);
                 Result::Ok(())
             }
         });

@@ -5095,7 +5095,16 @@ async fn execute_remote_batch_sql(config: &Config, statements: &[String]) -> Res
         .json()
         .await
         .context("invalid remote SQL batch response")?;
-    ensure_remote_pipeline_ok(&value)?;
+    ensure_remote_pipeline_ok(&value).with_context(|| {
+        format!(
+            "remote SQL batch failed; statements={}",
+            statements
+                .iter()
+                .map(|sql| compact_sql_for_log(sql))
+                .collect::<Vec<_>>()
+                .join("; ")
+        )
+    })?;
     Ok(())
 }
 
@@ -5532,7 +5541,8 @@ async fn query_remote_sql(config: &Config, sql: &str) -> Result<Vec<Vec<Value>>>
         .error_for_status()
         .with_context(|| format!("remote SQL query failed: {sql}"))?;
     let value: serde_json::Value = response.json().await?;
-    ensure_remote_pipeline_ok(&value)?;
+    ensure_remote_pipeline_ok(&value)
+        .with_context(|| format!("remote SQL failed: {sql_for_log}"))?;
     let rows = parse_remote_rows(&value)?;
     Ok(rows)
 }
