@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc, Mutex, RwLock,
@@ -2084,8 +2084,9 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             revert_session.end(false)?;
 
             // Phase 2: after revert DB has no local changes in its latest state - so its safe to apply changes from remote
-            let mut logical_replay_conn = None;
-            let mut applied_raw_db_size = 0;
+        let mut logical_replay_conn = None;
+        let mut remote_logical_touched_rows = BTreeSet::new();
+        let mut applied_raw_db_size = 0;
             match stream_kind {
             stream_kind if stream_kind_applies_remote_pages(stream_kind) => {
                 if matches!(stream_kind, DbChangesStreamKind::ReplaceBasePages) {
@@ -2282,6 +2283,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                     self.main_db_path,
                     replay_stats.touched_rows.len(),
                 );
+                remote_logical_touched_rows = replay_stats.touched_rows;
                 logical_replay_conn = Some(conn);
             }
             DbChangesStreamKind::LegacyPages
@@ -2442,6 +2444,26 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             && last_pushed_change_id_hint > 0
             && last_pushed_replay_floor_change_id_hint < last_pushed_change_id_hint
             && replay_floor == last_pushed_replay_floor_change_id_hint;
+        let mut skipped_pushed_self_changes_touched_by_remote = 0usize;
+        let local_changes = if replaying_pushed_self_range && !remote_logical_touched_rows.is_empty()
+        {
+            local_changes
+                .into_iter()
+                .filter(|change| {
+                    let already_pushed_self_change = change.change_id <= last_pushed_change_id_hint;
+                    let touched_by_remote = remote_logical_touched_rows
+                        .contains(&(change.table_name.clone(), change.id));
+                    if already_pushed_self_change && touched_by_remote {
+                        skipped_pushed_self_changes_touched_by_remote += 1;
+                        false
+                    } else {
+                        true
+                    }
+                })
+                .collect::<Vec<_>>()
+        } else {
+            local_changes
+        };
         let replayed_local_changes = !local_changes.is_empty();
         let delay_cdc_for_pushed_self_replay = logical_replay_conn.is_some()
             && replaying_pushed_self_range
@@ -2452,9 +2474,10 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         }
         let mut preserve_local_replay_floor = None;
         tracing::info!(
-            "apply_changes(path={}): collected {} changes",
+            "apply_changes(path={}): collected {} changes, skipped_pushed_self_changes_touched_by_remote={}",
             self.main_db_path,
-            local_changes.len()
+            local_changes.len(),
+            skipped_pushed_self_changes_touched_by_remote,
         );
         // Phase 6: replay local changes
         // we can skip this phase if we are sure that we had no local changes before
@@ -4258,7 +4281,7 @@ mod tests {
     }
 
     #[test]
-    fn logical_replay_replays_pushed_self_update_after_remote_backfill_touches_same_row() {
+    fn logical_replay_preserves_pushed_self_update_in_remote_backfill_row() {
         let main_file = NamedTempFile::new().unwrap();
         let changes_file = NamedTempFile::new().unwrap();
         let main_path = main_file.path().to_str().unwrap().to_string();
@@ -4333,8 +4356,8 @@ mod tests {
                             1,
                             logical_record(&[
                                 turso_core::Value::from_i64(1),
-                                turso_core::Value::build_text("seed"),
-                                turso_core::Value::build_text("seed-note"),
+                                turso_core::Value::build_text("local-pushed"),
+                                turso_core::Value::build_text("local-note"),
                                 turso_core::Value::from_i64(1),
                             ]),
                         ),

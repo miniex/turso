@@ -4728,10 +4728,11 @@ async fn wait_for_local_remote_convergence(
         }
         if Instant::now() >= deadline {
             bail!(
-                "local/remote failed to converge for {label} within {:?}\nlocal={}\nremote={}",
+                "local/remote failed to converge for {label} within {:?}\nlocal={}\nremote={}\ndiff={}",
                 CONVERGENCE_TIMEOUT,
                 summarize_snapshot(&local_snapshot),
                 summarize_snapshot(&remote),
+                summarize_snapshot_diff(&remote, &local_snapshot),
             );
         }
         if matches!(sync_mode, ConvergenceSyncMode::PushAndPull) {
