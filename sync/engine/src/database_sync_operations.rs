@@ -322,7 +322,7 @@ fn logical_schema_kind(kind: i32) -> Result<DatabaseSchemaKind> {
     })
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct LogicalReplayTableMap {
     names_by_stable_id: BTreeMap<u64, String>,
 }
@@ -452,6 +452,31 @@ pub struct LogicalReplayApplyStats {
     pub touched_rows: std::collections::BTreeSet<(String, i64)>,
 }
 
+fn logical_operations_touched_rows(
+    operations: &[DatabaseTapeOperation],
+) -> std::collections::BTreeSet<(String, i64)> {
+    operations
+        .iter()
+        .filter_map(|operation| match operation {
+            DatabaseTapeOperation::RowChange(change)
+                if is_logically_replayable_table(&change.table_name) =>
+            {
+                Some((change.table_name.clone(), change.id))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn logical_operations_touch_replayed_remote_rows(
+    operations: &[DatabaseTapeOperation],
+    stats: &LogicalReplayApplyStats,
+) -> bool {
+    logical_operations_touched_rows(operations)
+        .iter()
+        .any(|row| stats.touched_rows.contains(row))
+}
+
 /// Returns whether a logical transaction represents this client's own write.
 ///
 /// New MVCC payloads carry `origin_client_id`; older or mixed paths can also
@@ -498,22 +523,27 @@ async fn replay_logical_transactions<Ctx>(
     let mut table_map = LogicalReplayTableMap::default();
     let mut stats = LogicalReplayApplyStats::default();
     for txn in txns {
+        let mut decoded_table_map = table_map.clone();
+        let operations =
+            logical_txn_to_tape_operations_with_table_map(txn, &mut decoded_table_map)?;
         if let Some(excluded_client_id) = excluded_client_id {
             if logical_txn_acknowledges_client(txn, excluded_client_id)? {
+                if !logical_operations_touch_replayed_remote_rows(&operations, &stats) {
+                    tracing::debug!(
+                        "skipping logical transaction that acknowledges local client {excluded_client_id}"
+                    );
+                    continue;
+                }
                 tracing::debug!(
-                    "skipping logical transaction that acknowledges local client {excluded_client_id}"
+                    "replaying logical transaction for local client {excluded_client_id} because an earlier remote transaction touched the same row"
                 );
-                continue;
             }
         }
+        table_map = decoded_table_map;
         saw_replayed_txns = true;
-        for operation in logical_txn_to_tape_operations_with_table_map(txn, &mut table_map)? {
-            if let DatabaseTapeOperation::RowChange(change) = &operation {
-                if is_logically_replayable_table(&change.table_name) {
-                    stats
-                        .touched_rows
-                        .insert((change.table_name.clone(), change.id));
-                }
+        for operation in operations {
+            for row in logical_operations_touched_rows(std::slice::from_ref(&operation)) {
+                stats.touched_rows.insert(row);
             }
             replay.replay(coro, operation).await?;
         }
@@ -615,22 +645,27 @@ async fn replay_logical_transactions_from_file<Ctx>(
         LogicalReplayTableMap::from_persisted(std::mem::take(table_names_by_stable_id));
     loop {
         while let Some(txn) = take_proto_message_from_bytes::<LogicalTxnData>(&mut bytes)? {
+            let mut decoded_table_map = table_map.clone();
+            let operations =
+                logical_txn_to_tape_operations_with_table_map(&txn, &mut decoded_table_map)?;
             if let Some(excluded_client_id) = excluded_client_id {
                 if logical_txn_acknowledges_client(&txn, excluded_client_id)? {
+                    if !logical_operations_touch_replayed_remote_rows(&operations, &stats) {
+                        tracing::debug!(
+                            "skipping logical transaction that acknowledges local client {excluded_client_id}"
+                        );
+                        continue;
+                    }
                     tracing::debug!(
-                        "skipping logical transaction that acknowledges local client {excluded_client_id}"
+                        "replaying logical transaction for local client {excluded_client_id} because an earlier remote transaction touched the same row"
                     );
-                    continue;
                 }
             }
+            table_map = decoded_table_map;
             saw_replayed_txns = true;
-            for operation in logical_txn_to_tape_operations_with_table_map(&txn, &mut table_map)? {
-                if let DatabaseTapeOperation::RowChange(change) = &operation {
-                    if is_logically_replayable_table(&change.table_name) {
-                        stats
-                            .touched_rows
-                            .insert((change.table_name.clone(), change.id));
-                    }
+            for operation in operations {
+                for row in logical_operations_touched_rows(std::slice::from_ref(&operation)) {
+                    stats.touched_rows.insert(row);
                 }
                 replay.replay(coro, operation).await?;
             }
@@ -2499,6 +2534,7 @@ pub const TURSO_SYNC_UPDATE_LAST_CHANGE_ID: &str =
 const TURSO_SYNC_SELECT_LAST_CHANGE_ID: &str =
     "SELECT pull_gen, change_id FROM turso_sync_last_change_id NOT INDEXED WHERE client_id = ?";
 const TURSO_SYNC_SELECT_LAST_CHANGE_ID_DIAGNOSTIC: &str = "SELECT rowid, client_id, typeof(pull_gen), pull_gen, typeof(change_id), change_id FROM turso_sync_last_change_id NOT INDEXED WHERE client_id = ?";
+const TURSO_CDC_AUTOINCREMENT_SEQUENCE_NAME: &str = "__turso_internal_autoincrement_turso_cdc";
 
 /// Converts local SQLite values into Hrana protocol values for remote SQL.
 fn convert_to_args(values: Vec<turso_core::Value>) -> Vec<server_proto::Value> {
@@ -2631,6 +2667,62 @@ pub async fn max_local_change_id<Ctx>(
         };
     }
     unreachable!("max_local_change_id retry loop returns")
+}
+
+/// Returns the highest local CDC change id that cursor-based readers may pass.
+///
+/// MVCC AUTOINCREMENT can expose committed CDC rows out of sequence-id order:
+/// one transaction may allocate a lower id and commit after another transaction
+/// with a higher id. The sequence watermark is the first id that is not yet
+/// safe, so sync must not advance its cursor past `watermark - 1`.
+async fn max_safe_local_change_id<Ctx>(
+    coro: &Coro<Ctx>,
+    conn: &Arc<turso_core::Connection>,
+    use_sequence_watermark: bool,
+) -> Result<Option<i64>> {
+    let Some(max_change_id) = max_local_change_id(coro, conn).await? else {
+        return Ok(None);
+    };
+    if !use_sequence_watermark {
+        return Ok(Some(max_change_id));
+    }
+    Ok(Some(safe_change_id_from_sequence_watermark(
+        max_change_id,
+        local_cdc_sequence_watermark(coro, conn).await?,
+    )))
+}
+
+fn safe_change_id_from_sequence_watermark(max_change_id: i64, watermark: Option<i64>) -> i64 {
+    match watermark {
+        Some(watermark) => max_change_id.min(watermark.saturating_sub(1).max(0)),
+        None => max_change_id,
+    }
+}
+
+async fn local_cdc_sequence_watermark<Ctx>(
+    coro: &Coro<Ctx>,
+    conn: &Arc<turso_core::Connection>,
+) -> Result<Option<i64>> {
+    let mut stmt = conn.prepare("SELECT sequence_watermark_experimental(?)")?;
+    stmt.bind_at(
+        1.try_into().unwrap(),
+        Value::Text(Text::new(TURSO_CDC_AUTOINCREMENT_SEQUENCE_NAME.to_string())),
+    )?;
+    let value = match run_stmt_expect_one_row(coro, &mut stmt).await? {
+        Some(row) => row[0].clone(),
+        None => {
+            return Err(Error::DatabaseSyncEngineError(
+                "sequence_watermark_experimental returned no rows".to_string(),
+            ));
+        }
+    };
+    match value {
+        Value::Null => Ok(None),
+        Value::Numeric(turso_core::Numeric::Integer(value)) => Ok(Some(value)),
+        other => Err(Error::DatabaseSyncEngineError(format!(
+            "unexpected sequence_watermark_experimental column type: {other:?}"
+        ))),
+    }
 }
 
 /// Upserts the local high-water mark for one sync client.
@@ -2846,16 +2938,17 @@ pub async fn fetch_last_change_id<IO: SyncEngineIo, Ctx>(
     ctx: &SyncOperationCtx<'_, IO, Ctx>,
     source_conn: &Arc<turso_core::Connection>,
     client_id: &str,
+    source_safe_max_change_id: Option<i64>,
 ) -> Result<(i64, Option<i64>)> {
     tracing::debug!("fetch_last_change_id: client_id={client_id}");
 
     // fetch last_change_id from the target DB in order to guarantee atomic replay of changes and avoid conflicts in case of failure
     let (source_pull_gen, source_change_id) =
         read_last_change_id(ctx.coro, source_conn, client_id).await?;
-    let source_max_change_id = max_local_change_id(ctx.coro, source_conn).await?;
     tracing::debug!(
         "fetch_last_change_id: client_id={client_id}, source_pull_gen={source_pull_gen}"
     );
+    let source_change_id = clamp_change_id_to_safe_max(source_change_id, source_safe_max_change_id);
 
     // fetch last_change_id from the target DB in order to guarantee atomic replay of changes and avoid conflicts in case of failure
     let init_hrana_request = server_proto::PipelineReqBody {
@@ -2933,9 +3026,19 @@ pub async fn fetch_last_change_id<IO: SyncEngineIo, Ctx>(
         source_change_id,
         target_pull_gen,
         target_change_id,
-        source_max_change_id,
+        source_safe_max_change_id,
     );
     Ok((source_pull_gen, last_change_id))
+}
+
+fn clamp_change_id_to_safe_max(
+    change_id: Option<i64>,
+    source_safe_max_change_id: Option<i64>,
+) -> Option<i64> {
+    match (change_id, source_safe_max_change_id) {
+        (Some(change_id), Some(safe_max_change_id)) => Some(change_id.min(safe_max_change_id)),
+        (change_id, _) => change_id,
+    }
 }
 
 /// Resolves the local CDC floor to use for logical push.
@@ -2944,7 +3047,7 @@ fn resolve_logical_push_floor_change_id(
     source_change_id: Option<i64>,
     target_pull_gen: i64,
     target_change_id: i64,
-    source_max_change_id: Option<i64>,
+    source_safe_max_change_id: Option<i64>,
 ) -> Option<i64> {
     // Local CDC change ids are per-client monotonic ids, not remote generation
     // offsets. A remote generation rollover must not make the next logical push
@@ -2958,8 +3061,11 @@ fn resolve_logical_push_floor_change_id(
         return source_change_id;
     }
     // If the generation matches but the acknowledgement is beyond the current
-    // local CDC high-water mark, it also belongs to an older local CDC epoch.
-    if source_max_change_id.is_some_and(|max_change_id| target_change_id > max_change_id) {
+    // safe local CDC high-water mark, it either belongs to an older local CDC
+    // epoch or crosses an unsafe MVCC AUTOINCREMENT allocation gap.
+    if source_safe_max_change_id
+        .is_some_and(|safe_max_change_id| target_change_id > safe_max_change_id)
+    {
         return source_change_id;
     }
     Some(target_change_id)
@@ -2979,9 +3085,11 @@ pub async fn push_logical_changes<IO: SyncEngineIo, Ctx>(
     let source_conn = connect_untracked(source)?;
     let source_is_mvcc = source_journal_mode_is_mvcc(ctx.coro, &source_conn).await?;
     let logical_mvcc_push_active = source_is_mvcc && opts.logical_mvcc_pull;
+    let source_safe_max_change_id =
+        max_safe_local_change_id(ctx.coro, &source_conn, logical_mvcc_push_active).await?;
 
     let (source_pull_gen, mut last_change_id) =
-        fetch_last_change_id(ctx, &source_conn, client_id).await?;
+        fetch_last_change_id(ctx, &source_conn, client_id, source_safe_max_change_id).await?;
     let replay_floor_change_id = last_change_id.unwrap_or(0);
 
     tracing::debug!("push_logical_changes: last_change_id={:?}", last_change_id);
@@ -2993,6 +3101,7 @@ pub async fn push_logical_changes<IO: SyncEngineIo, Ctx>(
 
     let iterate_opts = DatabaseChangesIteratorOpts {
         first_change_id: last_change_id.map(|x| x + 1),
+        last_change_id: source_safe_max_change_id,
         mode: DatabaseChangesIteratorMode::Apply,
         ignore_schema_changes: false,
         ..Default::default()
@@ -3843,9 +3952,12 @@ pub async fn reset_wal_file<Ctx>(
 /// already has the desired schema.
 async fn sql_execute_http<IO: SyncEngineIo, Ctx>(
     ctx: &SyncOperationCtx<'_, IO, Ctx>,
-    request: server_proto::PipelineReqBody,
+    mut request: server_proto::PipelineReqBody,
     ignored_step_indices: &std::collections::HashSet<usize>,
 ) -> Result<Vec<StmtResult>> {
+    request
+        .requests
+        .push_back(StreamRequest::Close(server_proto::CloseStreamReq {}));
     let body = serde_json::to_vec(&request)?;
 
     ctx.io.network_stats.write(body.len());
@@ -3901,6 +4013,7 @@ async fn sql_execute_http<IO: SyncEngineIo, Ctx>(
                         results.push(result);
                     }
                 }
+                server_proto::StreamResponse::Close(_) => {}
             },
         }
     }
@@ -4828,6 +4941,114 @@ mod tests {
                         rows,
                         vec![vec![turso_core::Value::from_i64(2), text_value("remote")]]
                     );
+                    Result::Ok(())
+                }
+            }
+        });
+
+        loop {
+            match r#gen.resume_with(Ok(())) {
+                genawaiter::GeneratorState::Yielded(..) => io.step().unwrap(),
+                genawaiter::GeneratorState::Complete(result) => {
+                    result.unwrap();
+                    break;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn file_backed_logical_replay_applies_self_origin_when_remote_touched_row_first() {
+        let db_temp = NamedTempFile::new().unwrap();
+        let db_path = db_temp.path().to_str().unwrap().to_string();
+        let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let db = Arc::new(DatabaseTape::new(
+            turso_core::Database::open_file(io.clone(), &db_path).unwrap(),
+        ));
+
+        let txns = vec![
+            LogicalTxnData {
+                end_offset: 7,
+                commit_ts: 11,
+                origin_client_id: "remote-client".to_string(),
+                ops: vec![schema_op(
+                    LogicalSchemaAction::Create,
+                    LogicalSchemaKind::Table,
+                    "items",
+                    Some("CREATE TABLE items(id INTEGER PRIMARY KEY, payload TEXT)"),
+                )],
+            },
+            LogicalTxnData {
+                end_offset: 8,
+                commit_ts: 12,
+                origin_client_id: "remote-client".to_string(),
+                ops: vec![upsert_row_op(
+                    "items",
+                    1,
+                    record(&[turso_core::Value::from_i64(1), text_value("stale")]),
+                )],
+            },
+            LogicalTxnData {
+                end_offset: 9,
+                commit_ts: 13,
+                origin_client_id: "local-client".to_string(),
+                ops: vec![delete_row_op("items", 1)],
+            },
+        ];
+
+        let txns_temp = NamedTempFile::new().unwrap();
+        let mut txns_bytes = Vec::new();
+        for txn in &txns {
+            txns_bytes.extend_from_slice(&txn.encode_length_delimited_to_vec());
+        }
+        std::fs::write(txns_temp.path(), txns_bytes).unwrap();
+        let txns_file = io
+            .open_file(
+                txns_temp.path().to_str().unwrap(),
+                turso_core::OpenFlags::ReadOnly,
+                false,
+            )
+            .unwrap();
+
+        let mut r#gen = genawaiter::sync::Gen::new({
+            move |coro| {
+                let db = db.clone();
+                let txns_file = txns_file.clone();
+                async move {
+                    let coro: Coro<()> = coro.into();
+                    let mut replay = db
+                        .start_replay_session(
+                            &coro,
+                            DatabaseReplaySessionOpts {
+                                use_implicit_rowid: true,
+                            },
+                        )
+                        .await
+                        .unwrap();
+                    let mut table_names_by_stable_id = BTreeMap::new();
+                    apply_logical_transactions_file_without_commit_excluding_client_txns_with_table_map(
+                        &coro,
+                        &mut replay,
+                        &txns_file,
+                        "local-client",
+                        &mut table_names_by_stable_id,
+                    )
+                    .await
+                    .unwrap();
+                    replay
+                        .replay(&coro, DatabaseTapeOperation::Commit)
+                        .await
+                        .unwrap();
+
+                    let conn = db.connect_untracked().unwrap();
+                    let mut rows = Vec::new();
+                    let mut stmt = conn
+                        .prepare("SELECT id, payload FROM items ORDER BY id")
+                        .unwrap();
+                    while let Some(row) = run_stmt_once(&coro, &mut stmt).await.unwrap() {
+                        rows.push(row.get_values().cloned().collect::<Vec<_>>());
+                    }
+                    assert!(rows.is_empty(), "self-origin delete should win: {rows:?}");
                     Result::Ok(())
                 }
             }
@@ -7133,6 +7354,24 @@ mod tests {
     fn logical_push_ignores_remote_ack_from_old_local_cdc_epoch() {
         let floor = resolve_logical_push_floor_change_id(3, Some(1), 3, 10, Some(7));
         assert_eq!(floor, Some(1));
+    }
+
+    #[test]
+    fn logical_push_ignores_remote_ack_beyond_safe_mvcc_sequence_watermark() {
+        let floor = resolve_logical_push_floor_change_id(3, Some(4), 3, 6, Some(4));
+        assert_eq!(floor, Some(4));
+    }
+
+    #[test]
+    fn logical_push_clamps_local_ack_to_safe_mvcc_sequence_watermark() {
+        let floor = super::clamp_change_id_to_safe_max(Some(6), Some(4));
+        assert_eq!(floor, Some(4));
+    }
+
+    #[test]
+    fn logical_push_uses_max_change_id_when_mvcc_sequence_watermark_is_null() {
+        let safe = super::safe_change_id_from_sequence_watermark(12, None);
+        assert_eq!(safe, 12);
     }
 
     #[test]

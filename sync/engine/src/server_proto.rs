@@ -264,11 +264,16 @@ pub enum StreamRequest {
     #[serde(skip_deserializing)]
     #[default]
     None,
+    Close(CloseStreamReq),
     /// See [`ExecuteStreamReq`]
     Execute(ExecuteStreamReq),
     /// See [`BatchStreamReq`]
     Batch(BatchStreamReq),
 }
+
+#[derive(Serialize, Deserialize, Debug)]
+/// A request to close the current stream.
+pub struct CloseStreamReq {}
 
 #[derive(Serialize, Deserialize, Default, Debug, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -286,9 +291,14 @@ pub enum StreamResult {
 #[derive(Serialize, Deserialize, Debug, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum StreamResponse {
+    Close(CloseStreamResp),
     Execute(ExecuteStreamResp),
     Batch(BatchStreamResp),
 }
+
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
+/// A response to a [`CloseStreamReq`].
+pub struct CloseStreamResp {}
 
 #[derive(Serialize, Deserialize, Debug)]
 /// A request to execute a batch of SQL statements that may each have a [`BatchCond`] that must be satisfied for the statement to be executed.

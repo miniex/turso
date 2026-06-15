@@ -610,7 +610,7 @@ fn table_name_for_rootpage_in_mvcc_schema<Clock: LogicalClock>(
         }
         let row_versions = entry.value().read();
         for row_version in row_versions.iter().rev() {
-            if row_version.end.is_some() {
+            if row_version.end().is_some() {
                 continue;
             }
             let Ok(row) = portable_schema_row_from_record(row_version.row.payload()) else {

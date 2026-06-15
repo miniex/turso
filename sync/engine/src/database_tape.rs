@@ -186,6 +186,10 @@ impl DatabaseTape {
         if self.disable_auto_checkpoint {
             connection.wal_auto_actions_disable();
         }
+        // Tracked sync connections must persist portable logical metadata in
+        // MVCC log records. The CDC fast path below only restores CDC capture
+        // state, so enable this before either CDC setup path can return.
+        connection.set_portable_logical_changes_enabled(true);
         if self.try_enable_existing_cdc(coro, &connection).await? {
             return Ok(connection);
         }

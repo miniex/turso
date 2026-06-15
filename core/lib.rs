@@ -1984,6 +1984,7 @@ impl Database {
                 self.durable_storage.clone(),
                 None,
             )?;
+            self.mv_store.store(Some(mv_store.clone()));
             let mvcc_bootstrap_conn = self._connect(true, None, None)?;
             match mv_store.bootstrap(mvcc_bootstrap_conn.clone()) {
                 Ok(()) => {}
@@ -1993,7 +1994,6 @@ impl Database {
                 }
                 Err(error) => return Err(error),
             }
-            self.mv_store.store(Some(mv_store));
         } else {
             self.mv_store.store(None);
         }

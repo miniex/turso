@@ -1838,34 +1838,44 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         &self,
         coro: &Coro<Ctx>,
         remote_changes: DbChangesStatus,
-    ) -> Result<()> {
-        let new_revision = remote_changes.revision.clone();
-        let update_partial_lazy_revision = || {
+    ) -> Result<DatabasePullRevision> {
+        let mut new_revision = remote_changes.revision.clone();
+        let update_partial_lazy_revision = |new_revision: &DatabasePullRevision| {
             if let (Some(revision_handle), DatabasePullRevision::V1 { revision }) =
-                (&self.partial_lazy_server_revision, &new_revision)
+                (&self.partial_lazy_server_revision, new_revision)
             {
                 *revision_handle.write().unwrap() = revision.clone();
             }
         };
         if remote_changes.is_empty() {
-            update_partial_lazy_revision();
+            update_partial_lazy_revision(&new_revision);
             self.update_meta(coro, |m| {
                 m.synced_revision = Some(new_revision.clone());
                 m.last_pull_unix_time = Some(remote_changes.time.secs);
             })
             .await?;
-            return Ok(());
+            return Ok(new_revision);
         }
         let changes_file = remote_changes
             .file_slot
             .as_ref()
             .expect("non-empty remote changes must keep a file slot");
         let pull_result = self
-            .apply_changes_internal(coro, &changes_file.value, remote_changes.stream_kind)
+            .apply_changes_internal(
+                coro,
+                &changes_file.value,
+                remote_changes.stream_kind,
+                &remote_changes.revision,
+            )
             .await;
-        let Ok((revert_since_wal_watermark, logical_table_names_by_stable_id)) = pull_result else {
+        let Ok((revert_since_wal_watermark, logical_table_names_by_stable_id, followup_revision)) =
+            pull_result
+        else {
             return Err(pull_result.err().unwrap());
         };
+        if let Some(revision) = followup_revision {
+            new_revision = revision;
+        }
 
         let revert_wal_file = self.io.open_file(
             &self.revert_db_wal_path,
@@ -1884,8 +1894,8 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             m.logical_table_names_by_stable_id = logical_table_names_by_stable_id;
         })
         .await?;
-        update_partial_lazy_revision();
-        Ok(())
+        update_partial_lazy_revision(&new_revision);
+        Ok(new_revision)
     }
 
     async fn apply_changes_internal<Ctx>(
@@ -1893,7 +1903,8 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         coro: &Coro<Ctx>,
         changes_file: &Arc<dyn turso_core::File>,
         stream_kind: DbChangesStreamKind,
-    ) -> Result<(u64, BTreeMap<u64, String>)> {
+        remote_revision: &DatabasePullRevision,
+    ) -> Result<(u64, BTreeMap<u64, String>, Option<DatabasePullRevision>)> {
         tracing::info!("apply_changes(path={})", self.main_db_path);
 
         let (_, watermark) = self.checkpoint_passive(coro).await?;
@@ -1939,6 +1950,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         // read current pull generation from local table for the given client
         let (local_pull_gen, local_last_change_id) =
             read_last_change_id(coro, &main_conn, &self.client_unique_id).await?;
+        let no_checkpoint_replace_base = replace_base_pages && self.opts.logical_mvcc_pull;
         tracing::info!(
             "apply_changes(path={}): local sync high-water before remote apply: client_id={} pull_gen={} change_id={:?} replace_base={}",
             self.main_db_path,
@@ -1967,21 +1979,24 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                 stream_kind,
             );
         let replace_base_precollection_floor = if replace_base_pages {
-            // Replace-base snapshots are installed before local CDC replay, so
-            // collect local changes from the old view. Use the same push-hint
-            // aware floor that logical replay uses later; otherwise a local
-            // change that was already pushed can be replayed again on top of the
-            // replace-base snapshot that already contains it.
-            resolve_local_replay_floor_change_id(
-                true,
-                false,
-                local_pull_gen,
-                local_pull_gen,
-                local_last_change_id,
-                last_pushed_pull_gen_hint,
-                last_pushed_change_id_hint,
-                last_pushed_replay_floor_change_id_hint,
-            )
+            if no_checkpoint_replace_base {
+                None
+            } else {
+                // Checkpointed replace-base snapshots include this client's
+                // pushed writes, so the push hint can suppress duplicate
+                // replay. No-checkpoint MVCC snapshots stream the generation
+                // base and must replay the client's local tail on top.
+                resolve_local_replay_floor_change_id(
+                    true,
+                    false,
+                    local_pull_gen,
+                    local_pull_gen,
+                    local_last_change_id,
+                    last_pushed_pull_gen_hint,
+                    last_pushed_change_id_hint,
+                    last_pushed_replay_floor_change_id_hint,
+                )
+            }
         } else {
             None
         };
@@ -2047,7 +2062,11 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             None
         };
 
-        let apply_result: Result<(u64, BTreeMap<u64, String>)> = async {
+        let apply_result: Result<(
+            u64,
+            BTreeMap<u64, String>,
+            Option<DatabasePullRevision>,
+        )> = async {
             let mut main_session = Some(DatabaseWalSession::new(coro, main_session).await?);
 
             // Phase 1 (start): rollback local changes from the WAL
@@ -2087,6 +2106,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         let mut logical_replay_conn = None;
         let mut remote_logical_touched_rows = BTreeSet::new();
         let mut applied_raw_db_size = 0;
+        let mut followup_revision = None;
             match stream_kind {
             stream_kind if stream_kind_applies_remote_pages(stream_kind) => {
                 if matches!(stream_kind, DbChangesStreamKind::ReplaceBasePages) {
@@ -2234,6 +2254,80 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                     // transaction on a fresh connection rather than the raw WAL
                     // session used to install the remote page snapshot.
                     logical_replay_conn = Some(conn);
+
+                    if self.opts.logical_mvcc_pull {
+                        let DatabasePullRevision::V1 { revision } = remote_revision else {
+                            return Err(Error::DatabaseSyncEngineError(format!(
+                                "replace-base follow-up logical pull requires a V1 revision, got {remote_revision:?}"
+                            )));
+                        };
+                        tracing::info!(
+                            "apply_changes(path={}): replace-base snapshot installed; issuing one follow-up logical pull from revision {} before local replay",
+                            self.main_db_path,
+                            revision,
+                        );
+                        let ctx = &SyncOperationCtx::new(
+                            coro,
+                            &self.sync_engine_io,
+                            self.meta().remote_url(),
+                            self.opts.remote_encryption_key.as_deref(),
+                        );
+                        match pull_updates_v1(ctx, changes_file, revision, None, true).await? {
+                            (
+                                next_revision,
+                                PullUpdatesV1Result::Logical { txns, ops },
+                            ) => {
+                                tracing::info!(
+                                    "apply_changes(path={}): replace-base follow-up logical pull returned {} transactions / {} ops",
+                                    self.main_db_path,
+                                    txns,
+                                    ops,
+                                );
+                                followup_revision = Some(next_revision);
+                                if txns != 0 || ops != 0 || changes_file.size()? != 0 {
+                                    let replay_conn = logical_replay_conn
+                                        .as_ref()
+                                        .expect("replace-base replay connection should exist");
+                                    let mut replay = DatabaseReplaySession {
+                                        conn: replay_conn.clone(),
+                                        cached_delete_stmt: HashMap::new(),
+                                        cached_insert_stmt: HashMap::new(),
+                                        cached_update_stmt: HashMap::new(),
+                                        in_txn: true,
+                                        generator: DatabaseReplayGenerator {
+                                            conn: replay_conn.clone(),
+                                            opts: DatabaseReplaySessionOpts {
+                                                use_implicit_rowid: true,
+                                            },
+                                        },
+                                    };
+                                    let replay_stats =
+                                        apply_logical_transactions_file_without_commit_excluding_client_txns_with_table_map_and_stats(
+                                            coro,
+                                            &mut replay,
+                                            changes_file,
+                                            &self.client_unique_id,
+                                            &mut logical_table_names_by_stable_id,
+                                        )
+                                        .await
+                                        .map_err(|error| {
+                                            Error::DatabaseSyncEngineError(format!(
+                                                "failed to apply replace-base follow-up logical transactions: {error}",
+                                            ))
+                                        })?;
+                                    remote_logical_touched_rows = replay_stats.touched_rows;
+                                }
+                            }
+                            (
+                                _,
+                                PullUpdatesV1Result::Pages { replace_base },
+                            ) => {
+                                return Err(Error::DatabaseSyncEngineError(format!(
+                                    "replace-base follow-up logical pull unexpectedly returned a page stream: replace_base={replace_base}"
+                                )));
+                            }
+                        }
+                    }
                 }
             }
             DbChangesStreamKind::Logical => {
@@ -2350,13 +2444,14 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             }
         }
         // Pull apply rolls back the local WAL while installing remote changes,
-        // so pending local CDC must be replayed locally afterward. Page and
-        // replace-base transports include this client's pushed writes in the
-        // installed remote image, so the push hint can suppress duplicate
-        // replay. Logical pulls filter self-originated transactions from the
-        // remote stream; using the push hint there would skip the local replay
-        // of those filtered writes.
-        let use_pushed_change_hint = use_pushed_change_hint_for_local_replay(stream_kind);
+        // so pending local CDC must be replayed locally afterward. Normal page
+        // transports include this client's pushed writes in the installed
+        // remote image, so the push hint can suppress duplicate replay. Logical
+        // MVCC replace-base streams only the generation base, and logical pulls
+        // filter self-originated transactions from the remote stream; using the
+        // push hint there would skip the local replay of those filtered writes.
+        let use_pushed_change_hint =
+            use_pushed_change_hint_for_local_replay(stream_kind) && !no_checkpoint_replace_base;
         let use_pushed_replay_floor_hint =
             use_pushed_replay_floor_hint_for_local_replay(stream_kind);
 
@@ -2369,7 +2464,14 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                     local_pull_gen,
                     local_last_change_id,
                 );
-            (local_pull_gen, local_last_change_id)
+            (
+                local_pull_gen,
+                if no_checkpoint_replace_base {
+                    None
+                } else {
+                    local_last_change_id
+                },
+            )
         } else {
             read_last_change_id(coro, phase_conn, &self.client_unique_id)
                 .await
@@ -2698,6 +2800,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             return Ok((
                 logical_conn.wal_state()?.max_frame,
                 logical_table_names_by_stable_id,
+                followup_revision,
             ));
         }
         if main_conn.has_main_mvcc_tx_for_wal_session() {
@@ -2773,7 +2876,11 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
 
             let logical_table_names_by_stable_id =
                 read_logical_replay_table_map(coro, &main_conn).await?;
-            Ok((main_conn.wal_state()?.max_frame, logical_table_names_by_stable_id))
+            Ok((
+                main_conn.wal_state()?.max_frame,
+                logical_table_names_by_stable_id,
+                followup_revision,
+            ))
         }
         .await;
 
@@ -2891,8 +2998,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                 .wait_changes_from_remote_with_timeout(coro, long_poll_timeout)
                 .await?;
             let is_empty = changes.is_empty();
-            let next_revision = Some(changes.revision.clone());
-            self.apply_changes_from_remote(coro, changes).await?;
+            let next_revision = Some(self.apply_changes_from_remote(coro, changes).await?);
 
             if is_empty || next_revision == previous_revision {
                 return Ok(());
@@ -3139,7 +3245,7 @@ mod tests {
             remote_encryption_key: None,
             push_operations_threshold: None,
             pull_bytes_threshold: None,
-            logical_mvcc_pull: true,
+            logical_mvcc_pull: false,
         }
     }
 
