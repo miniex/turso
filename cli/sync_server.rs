@@ -13,11 +13,11 @@ use tracing::{debug, error, info};
 
 use turso_core::{Connection, Value as CoreValue};
 use turso_sync_engine::server_proto::{
-    BatchCond, BatchResult, BatchStep, BatchStreamReq, BatchStreamResp, CloseStreamResp, Col,
-    Error, ExecuteStreamReq, ExecuteStreamResp, PageData, PageSetRawEncodingProto,
-    PageUpdatesEncodingReq, PipelineReqBody, PipelineRespBody, PullUpdatesApplyMode,
-    PullUpdatesReqProtoBody, PullUpdatesRespProtoBody, PullUpdatesStreamKind, Row, StmtResult,
-    StreamRequest, StreamResponse, StreamResult, Value,
+    BatchCond, BatchResult, BatchStep, BatchStreamReq, BatchStreamResp, Col, Error,
+    ExecuteStreamReq, ExecuteStreamResp, PageData, PageSetRawEncodingProto, PageUpdatesEncodingReq,
+    PipelineReqBody, PipelineRespBody, PullUpdatesApplyMode, PullUpdatesReqProtoBody,
+    PullUpdatesRespProtoBody, PullUpdatesStreamKind, Row, StmtResult, StreamRequest,
+    StreamResponse, StreamResult, Value,
 };
 
 const WAL_FRAME_HEADER_SIZE: usize = 24;
