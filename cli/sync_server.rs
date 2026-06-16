@@ -13,11 +13,11 @@ use tracing::{debug, error, info};
 
 use turso_core::{Connection, Value as CoreValue};
 use turso_sync_engine::server_proto::{
-    BatchCond, BatchResult, BatchStep, BatchStreamReq, BatchStreamResp, Col, Error,
-    ExecuteStreamReq, ExecuteStreamResp, PageData, PageSetRawEncodingProto, PageUpdatesEncodingReq,
-    PipelineReqBody, PipelineRespBody, PullUpdatesApplyMode, PullUpdatesReqProtoBody,
-    PullUpdatesRespProtoBody, PullUpdatesStreamKind, Row, StmtResult, StreamRequest,
-    StreamResponse, StreamResult, Value,
+    BatchCond, BatchResult, BatchStep, BatchStreamReq, BatchStreamResp, CloseStreamResp, Col,
+    Error, ExecuteStreamReq, ExecuteStreamResp, PageData, PageSetRawEncodingProto,
+    PageUpdatesEncodingReq, PipelineReqBody, PipelineRespBody, PullUpdatesApplyMode,
+    PullUpdatesReqProtoBody, PullUpdatesRespProtoBody, PullUpdatesStreamKind, Row, StmtResult,
+    StreamRequest, StreamResponse, StreamResult, Value,
 };
 
 const WAL_FRAME_HEADER_SIZE: usize = 24;
@@ -177,7 +177,7 @@ impl TursoSyncServer {
             let result = match request {
                 StreamRequest::Execute(exec_req) => self.execute_statement(&conn, &exec_req),
                 StreamRequest::Batch(batch_req) => self.execute_batch(&conn, &batch_req),
-                StreamRequest::None => StreamResult::Error {
+                StreamRequest::Close(_) | StreamRequest::None => StreamResult::Error {
                     error: Error {
                         message: "Unknown request type".to_string(),
                         code: "UNKNOWN".to_string(),
