@@ -330,6 +330,8 @@ export interface SyncEngineOpts {
    * partial-sync uses the query bootstrap strategy.
    */
   pullBytesThreshold?: number
+  /** Opt into MVCC logical pull-updates streams. Defaults to false. */
+  logicalMvccPull?: boolean
 }
 
 export declare const enum SyncEngineProtocolVersion {

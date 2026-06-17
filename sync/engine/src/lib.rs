@@ -1,3 +1,4 @@
+pub mod client_proto;
 pub mod database_replay_generator;
 pub mod database_sync_engine;
 pub mod database_sync_engine_io;

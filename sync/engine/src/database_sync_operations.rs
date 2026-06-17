@@ -15,6 +15,9 @@ use turso_core::{
 };
 
 use crate::{
+    client_proto::{
+        LogicalOp, LogicalOpType, LogicalSchemaAction, LogicalSchemaKind, LogicalTxnData,
+    },
     database_replay_generator::DatabaseReplayGenerator,
     database_sync_engine::{DataStats, DatabaseSyncEngineOpts},
     database_sync_engine_io::{DataCompletion, DataPollResult, SyncEngineIo},
@@ -26,8 +29,7 @@ use crate::{
     errors::Error,
     io_operations::IoOperations,
     server_proto::{
-        self, Batch, BatchCond, BatchStep, BatchStreamReq, LogicalOp, LogicalOpType,
-        LogicalSchemaAction, LogicalSchemaKind, LogicalTxnData, PageData, PageUpdatesEncodingReq,
+        self, Batch, BatchCond, BatchStep, BatchStreamReq, PageData, PageUpdatesEncodingReq,
         PullUpdatesApplyMode, PullUpdatesReqProtoBody, PullUpdatesRespProtoBody,
         PullUpdatesStreamKind, Stmt, StmtResult, StreamRequest,
     },
@@ -154,6 +156,9 @@ fn logical_op_to_tape_operations(
         Error::DatabaseSyncEngineError(format!("unknown logical op type: {}", op.op_type))
     })?;
     match op_type {
+        LogicalOpType::Unspecified => Err(Error::DatabaseSyncEngineError(
+            "logical op type must not be unspecified".to_string(),
+        )),
         LogicalOpType::UpsertRow => {
             if op.table_name.is_empty() {
                 return Err(Error::DatabaseSyncEngineError(
@@ -220,6 +225,11 @@ fn logical_op_to_tape_operations(
                 )
             })?)?;
             let operation = match schema_action {
+                LogicalSchemaAction::Unspecified => {
+                    return Err(Error::DatabaseSyncEngineError(
+                        "logical schema action must not be unspecified".to_string(),
+                    ));
+                }
                 LogicalSchemaAction::Create => {
                     if op.sql.is_empty() {
                         return Err(Error::DatabaseSyncEngineError(
@@ -315,6 +325,11 @@ fn logical_schema_kind(kind: i32) -> Result<DatabaseSchemaKind> {
         Error::DatabaseSyncEngineError(format!("unknown logical schema kind: {kind}"))
     })?;
     Ok(match kind {
+        LogicalSchemaKind::Unspecified => {
+            return Err(Error::DatabaseSyncEngineError(
+                "logical schema kind must not be unspecified".to_string(),
+            ));
+        }
         LogicalSchemaKind::Table => DatabaseSchemaKind::Table,
         LogicalSchemaKind::Index => DatabaseSchemaKind::Index,
         LogicalSchemaKind::Trigger => DatabaseSchemaKind::Trigger,
@@ -367,6 +382,7 @@ impl LogicalReplayTableMap {
             return;
         }
         match schema_action {
+            LogicalSchemaAction::Unspecified => {}
             LogicalSchemaAction::Create
             | LogicalSchemaAction::Refresh
             | LogicalSchemaAction::Alter => {
@@ -399,6 +415,11 @@ fn logical_txn_to_tape_operations_with_table_map(
             Error::DatabaseSyncEngineError(format!("unknown logical op type: {}", op.op_type))
         })?;
         match op_type {
+            LogicalOpType::Unspecified => {
+                return Err(Error::DatabaseSyncEngineError(
+                    "logical op type must not be unspecified".to_string(),
+                ));
+            }
             LogicalOpType::UpsertRow | LogicalOpType::DeleteRow => {
                 let table_name = table_map.resolve_row_table_name(&op)?;
                 if !is_logically_replayable_table(&table_name) {
@@ -3241,13 +3262,13 @@ async fn send_push_batch<IO: SyncEngineIo, Ctx>(
     let mut add_column_step_indices = std::collections::HashSet::new();
     let initial_last_change_id = last_change_id;
     let mut sql_over_http_requests = Vec::new();
-    let send_mvcc_log_meta =
-        should_send_mvcc_log_meta(opts.protocol_version_hint, logical_mvcc_push_active);
-    if send_mvcc_log_meta {
+    let send_mvcc_log_meta_conn =
+        should_send_mvcc_log_meta_conn(opts.protocol_version_hint, logical_mvcc_push_active);
+    if send_mvcc_log_meta_conn {
         sql_over_http_requests.push(BatchStep {
             stmt: Stmt {
                 sql: Some(format!(
-                    "PRAGMA mvcc_log_meta('client', {})",
+                    "PRAGMA mvcc_log_meta_conn('client', {})",
                     quote_sql_string(client_id)
                 )),
                 sql_id: None,
@@ -3434,7 +3455,7 @@ async fn send_push_batch<IO: SyncEngineIo, Ctx>(
             ],
         ));
     }
-    append_push_commit_steps(&mut sql_over_http_requests, send_mvcc_log_meta);
+    append_push_commit_steps(&mut sql_over_http_requests, send_mvcc_log_meta_conn);
 
     tracing::debug!(
         "push_logical_changes: client_id={client_id}, request_steps={} ignored_alter_add_column_steps={}",
@@ -3461,14 +3482,14 @@ fn quote_sql_string(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
-fn should_send_mvcc_log_meta(
+fn should_send_mvcc_log_meta_conn(
     protocol_version_hint: DatabaseSyncEngineProtocolVersion,
     logical_mvcc_push_active: bool,
 ) -> bool {
     logical_mvcc_push_active && protocol_version_hint == DatabaseSyncEngineProtocolVersion::V1
 }
 
-fn append_push_commit_steps(steps: &mut Vec<BatchStep>, send_mvcc_log_meta: bool) {
+fn append_push_commit_steps(steps: &mut Vec<BatchStep>, send_mvcc_log_meta_conn: bool) {
     steps.push(BatchStep {
         stmt: Stmt {
             sql: Some("COMMIT".to_string()),
@@ -3482,7 +3503,7 @@ fn append_push_commit_steps(steps: &mut Vec<BatchStep>, send_mvcc_log_meta: bool
             cond: Box::new(BatchCond::IsAutocommit {}),
         }),
     });
-    if send_mvcc_log_meta {
+    if send_mvcc_log_meta_conn {
         steps.push(mvcc_log_meta_clear_step());
     }
 }
@@ -3490,7 +3511,7 @@ fn append_push_commit_steps(steps: &mut Vec<BatchStep>, send_mvcc_log_meta: bool
 fn mvcc_log_meta_clear_step() -> BatchStep {
     BatchStep {
         stmt: Stmt {
-            sql: Some("PRAGMA mvcc_log_meta('client', NULL)".to_string()),
+            sql: Some("PRAGMA mvcc_log_meta_conn('client', NULL)".to_string()),
             sql_id: None,
             args: Vec::new(),
             named_args: Vec::new(),
@@ -5099,15 +5120,15 @@ mod tests {
 
     #[test]
     fn mvcc_log_meta_is_sent_only_for_v1_mvcc_sources() {
-        assert!(super::should_send_mvcc_log_meta(
+        assert!(super::should_send_mvcc_log_meta_conn(
             DatabaseSyncEngineProtocolVersion::V1,
             true
         ));
-        assert!(!super::should_send_mvcc_log_meta(
+        assert!(!super::should_send_mvcc_log_meta_conn(
             DatabaseSyncEngineProtocolVersion::V1,
             false
         ));
-        assert!(!super::should_send_mvcc_log_meta(
+        assert!(!super::should_send_mvcc_log_meta_conn(
             DatabaseSyncEngineProtocolVersion::Legacy,
             true
         ));
@@ -5130,7 +5151,7 @@ mod tests {
         );
         assert_eq!(
             steps[1].stmt.sql.as_deref(),
-            Some("PRAGMA mvcc_log_meta('client', NULL)")
+            Some("PRAGMA mvcc_log_meta_conn('client', NULL)")
         );
         assert!(
             steps[1].condition.is_none(),
@@ -5150,6 +5171,7 @@ mod tests {
     fn test_schema_record(op: &LogicalOp) -> Bytes {
         let kind = LogicalSchemaKind::try_from(op.schema_kind.unwrap()).unwrap();
         let row_type = match kind {
+            LogicalSchemaKind::Unspecified => panic!("test schema kind must be specified"),
             LogicalSchemaKind::Table => "table",
             LogicalSchemaKind::Index => "index",
             LogicalSchemaKind::Trigger => "trigger",

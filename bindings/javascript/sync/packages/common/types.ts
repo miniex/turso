@@ -141,6 +141,11 @@ export interface DatabaseOpts {
      */
     pullBytesThreshold?: number,
     /**
+     * opt into raw MVCC logical-log pull-updates streams when the server supports them.
+     * unset (default) uses page/WAL sync.
+     */
+    logicalMvccPull?: boolean,
+    /**
      * optional fetch override used for every HTTP request made by the sync engine
      * (push, pull, wait-for-changes). drop-in replacement for `globalThis.fetch`.
      * use cases:

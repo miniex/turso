@@ -164,7 +164,7 @@ pub struct SyncEngineOpts {
     /// partial-sync uses the query bootstrap strategy.
     pub pull_bytes_threshold: Option<u32>,
     /// Opt into MVCC logical pull-updates streams when the server supports them.
-    /// Defaults to true.
+    /// Defaults to false.
     pub logical_mvcc_pull: Option<bool>,
 }
 
@@ -337,7 +337,7 @@ impl SyncEngine {
             remote_encryption_key: opts.remote_encryption_key.clone(),
             push_operations_threshold: opts.push_operations_threshold.map(|x| x as usize),
             pull_bytes_threshold: opts.pull_bytes_threshold.map(|x| x as usize),
-            logical_mvcc_pull: opts.logical_mvcc_pull.unwrap_or(true),
+            logical_mvcc_pull: opts.logical_mvcc_pull.unwrap_or(false),
         };
         Ok(SyncEngine {
             opts: opts_filled,

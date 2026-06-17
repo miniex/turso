@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc, Mutex, RwLock,
+        Arc, Mutex,
     },
 };
 
@@ -121,7 +121,6 @@ pub struct DatabaseSyncEngine<IO: SyncEngineIo> {
     opts: DatabaseSyncEngineOpts,
     meta: Mutex<DatabaseMetadata>,
     client_unique_id: String,
-    partial_lazy_server_revision: Option<Arc<RwLock<String>>>,
 }
 
 fn db_size_from_page(page: &[u8]) -> u32 {
@@ -888,6 +887,11 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         let meta_path = create_meta_path(main_db_path);
         let partial_sync_opts = opts.partial_sync_opts.clone();
         let partial = partial_sync_opts.is_some();
+        let logical_mvcc_pull_active = should_use_logical_mvcc_pull(
+            opts.logical_mvcc_pull,
+            partial,
+            opts.remote_encryption_key.as_deref(),
+        );
         if let Some(reason) = logical_mvcc_pull_disable_reason(
             opts.logical_mvcc_pull,
             partial,
@@ -953,6 +957,8 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                     } else {
                         None
                     },
+                    fresh_bootstrap_pending_cdc_ack: true,
+                    logical_mvcc_pull_active,
                     logical_table_names_by_stable_id: Default::default(),
                     saved_configuration: Some(configuration),
                 };
@@ -994,6 +1000,8 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                     last_pull_unix_time: None,
                     last_push_unix_time: None,
                     partial_bootstrap_server_revision: None,
+                    fresh_bootstrap_pending_cdc_ack: false,
+                    logical_mvcc_pull_active,
                     logical_table_names_by_stable_id: Default::default(),
                     saved_configuration: Some(configuration),
                 };
@@ -1030,16 +1038,14 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         Ok(meta)
     }
 
-    #[allow(clippy::type_complexity)]
     pub fn init_db_storage(
         io: Arc<dyn turso_core::IO>,
         sync_engine_io: SyncEngineIoStats<IO>,
         meta: &DatabaseMetadata,
         main_db_path: &str,
         remote_encryption_key: Option<&str>,
-    ) -> Result<(Arc<dyn DatabaseStorage>, Option<Arc<RwLock<String>>>)> {
+    ) -> Result<Arc<dyn DatabaseStorage>> {
         let db_file = io.open_file(main_db_path, turso_core::OpenFlags::Create, false)?;
-        let mut partial_lazy_server_revision = None;
         let db_file: Arc<dyn DatabaseStorage> = if let Some(partial_sync_opts) =
             meta.partial_sync_opts()
         {
@@ -1056,13 +1062,11 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             };
             tracing::info!("create LazyDatabaseStorage database storage");
             let encoded_key = remote_encryption_key.map(|k| k.to_string());
-            let revision_handle = Arc::new(RwLock::new(revision.to_string()));
-            partial_lazy_server_revision = Some(revision_handle.clone());
             Arc::new(LazyDatabaseStorage::new(
                 db_file,
                 None, // todo(sivukhin): allocate dirty file for FS IO
                 sync_engine_io.clone(),
-                revision_handle,
+                revision.to_string(),
                 partial_sync_opts,
                 meta.saved_configuration
                     .as_ref()
@@ -1074,7 +1078,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             Arc::new(turso_core::storage::database::DatabaseFile::new(db_file))
         };
 
-        Ok((db_file, partial_lazy_server_revision))
+        Ok(db_file)
     }
 
     pub async fn open_db<Ctx>(
@@ -1158,7 +1162,6 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             opts,
             meta: Mutex::new(meta.clone()),
             client_unique_id: meta.client_unique_id.clone(),
-            partial_lazy_server_revision: None,
         };
 
         let synced_revision = meta.synced_revision.as_ref();
@@ -1194,7 +1197,6 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         .await?;
         let meta = Self::read_db_meta(coro, Some(io.clone()), sync_engine_io.clone(), main_db_path)
             .await?;
-        let fresh_bootstrap = meta.is_none() && opts.bootstrap_if_empty;
         let meta = Self::bootstrap_db(
             coro,
             io.clone(),
@@ -1204,7 +1206,8 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             meta,
         )
         .await?;
-        let (main_db_storage, partial_lazy_server_revision) = Self::init_db_storage(
+        let fresh_bootstrap_pending_cdc_ack = meta.fresh_bootstrap_pending_cdc_ack;
+        let main_db_storage = Self::init_db_storage(
             io.clone(),
             sync_engine_io.clone(),
             &meta,
@@ -1234,17 +1237,10 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             }
         };
 
-        let mut db = Self::open_db(coro, io, sync_engine_io, main_db, opts).await?;
-        db.partial_lazy_server_revision = partial_lazy_server_revision;
-        if fresh_bootstrap {
-            let main_conn = connect_untracked(&db.main_tape)?;
-            acknowledge_existing_cdc_for_client(
-                coro,
-                &main_conn,
-                &db.client_unique_id,
-                "fresh bootstrap",
-            )
-            .await?;
+        let db = Self::open_db(coro, io, sync_engine_io, main_db, opts).await?;
+        if fresh_bootstrap_pending_cdc_ack {
+            db.acknowledge_existing_cdc_for_current_client(coro, "fresh bootstrap")
+                .await?;
         }
         Ok(db)
     }
@@ -1544,6 +1540,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             last_push_unix_time,
             last_pushed_pull_gen_hint,
             last_pushed_change_id_hint,
+            logical_mvcc_pull_active,
         ) = {
             let meta = self.meta();
             (
@@ -1553,6 +1550,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                 meta.last_push_unix_time,
                 meta.last_pushed_pull_gen_hint,
                 meta.last_pushed_change_id_hint,
+                meta.logical_mvcc_pull_active,
             )
         };
         let ctx = &SyncOperationCtx::new(
@@ -1561,23 +1559,6 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             saved_remote_url.clone(),
             self.opts.remote_encryption_key.as_deref(),
         );
-        let partial = self.opts.partial_sync_opts.is_some();
-        let use_logical_mvcc_pull = should_use_logical_mvcc_pull(
-            self.opts.logical_mvcc_pull,
-            partial,
-            self.opts.remote_encryption_key.as_deref(),
-        );
-        if let Some(reason) = logical_mvcc_pull_disable_reason(
-            self.opts.logical_mvcc_pull,
-            partial,
-            self.opts.remote_encryption_key.as_deref(),
-        ) {
-            tracing::info!(
-                "wait_changes(path={}): logical MVCC pull requested but disabled because {}",
-                self.main_db_path,
-                reason
-            );
-        }
         tracing::info!(
             "wait_changes(path={}): remote_url={:?} revision={} client_id={} logical_mvcc_pull_requested={} logical_mvcc_pull_active={} long_poll_timeout_ms={} last_pull_unix_time={:?} last_push_unix_time={:?} last_pushed_pull_gen_hint={} last_pushed_change_id_hint={}",
             self.main_db_path,
@@ -1585,7 +1566,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             describe_pull_revision(&revision),
             self.client_unique_id,
             self.opts.logical_mvcc_pull,
-            use_logical_mvcc_pull,
+            logical_mvcc_pull_active,
             long_poll_timeout.map(|x| x.as_millis()).unwrap_or(0),
             last_pull_unix_time,
             last_push_unix_time,
@@ -1593,7 +1574,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             last_pushed_change_id_hint
         );
         let mut stream_kind = DbChangesStreamKind::Pages;
-        let next_revision = if use_logical_mvcc_pull {
+        let next_revision = if logical_mvcc_pull_active {
             let initial_logical_page_bootstrap = revision.is_none();
             let logical_pull = match &revision {
                 Some(DatabasePullRevision::V1 { revision }) => {
@@ -1840,15 +1821,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         remote_changes: DbChangesStatus,
     ) -> Result<DatabasePullRevision> {
         let mut new_revision = remote_changes.revision.clone();
-        let update_partial_lazy_revision = |new_revision: &DatabasePullRevision| {
-            if let (Some(revision_handle), DatabasePullRevision::V1 { revision }) =
-                (&self.partial_lazy_server_revision, new_revision)
-            {
-                *revision_handle.write().unwrap() = revision.clone();
-            }
-        };
         if remote_changes.is_empty() {
-            update_partial_lazy_revision(&new_revision);
             self.update_meta(coro, |m| {
                 m.synced_revision = Some(new_revision.clone());
                 m.last_pull_unix_time = Some(remote_changes.time.secs);
@@ -1860,6 +1833,27 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             .file_slot
             .as_ref()
             .expect("non-empty remote changes must keep a file slot");
+        if matches!(remote_changes.stream_kind, DbChangesStreamKind::Logical) {
+            let (logical_table_names_by_stable_id, followup_revision) = self
+                .apply_logical_mvcc_changes_internal(coro, &changes_file.value)
+                .await?;
+            if let Some(revision) = followup_revision {
+                new_revision = revision;
+            }
+
+            self.update_meta(coro, |m| {
+                m.revert_since_wal_salt = None;
+                m.revert_since_wal_watermark = 0;
+                m.synced_revision = Some(new_revision.clone());
+                m.last_pushed_pull_gen_hint = 0;
+                m.last_pushed_change_id_hint = 0;
+                m.last_pushed_replay_floor_change_id_hint = 0;
+                m.last_pull_unix_time = Some(remote_changes.time.secs);
+                m.logical_table_names_by_stable_id = logical_table_names_by_stable_id;
+            })
+            .await?;
+            return Ok(new_revision);
+        };
         let pull_result = self
             .apply_changes_internal(
                 coro,
@@ -1894,8 +1888,392 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             m.logical_table_names_by_stable_id = logical_table_names_by_stable_id;
         })
         .await?;
-        update_partial_lazy_revision(&new_revision);
         Ok(new_revision)
+    }
+
+    async fn apply_logical_mvcc_changes_internal<Ctx>(
+        &self,
+        coro: &Coro<Ctx>,
+        changes_file: &Arc<dyn turso_core::File>,
+    ) -> Result<(BTreeMap<u64, String>, Option<DatabasePullRevision>)> {
+        tracing::info!("apply_logical_mvcc_changes(path={})", self.main_db_path);
+
+        let conn = connect_untracked(&self.main_tape)?;
+        let had_cdc_table = has_table(coro, &conn, "turso_cdc").await?;
+        let pre_apply_local_change_id = if had_cdc_table {
+            max_local_change_id(coro, &conn).await?
+        } else {
+            None
+        };
+        tracing::info!(
+            "apply_logical_mvcc_changes(path={}): pre-apply local CDC high-water mark: {:?}",
+            self.main_db_path,
+            pre_apply_local_change_id
+        );
+
+        let (local_pull_gen, local_last_change_id) =
+            read_last_change_id(coro, &conn, &self.client_unique_id).await?;
+        let (
+            last_pushed_pull_gen_hint,
+            last_pushed_change_id_hint,
+            last_pushed_replay_floor_change_id_hint,
+        ) = {
+            let meta = self.meta();
+            (
+                meta.last_pushed_pull_gen_hint,
+                meta.last_pushed_change_id_hint,
+                meta.last_pushed_replay_floor_change_id_hint,
+            )
+        };
+        tracing::info!(
+            "apply_logical_mvcc_changes(path={}): local sync high-water before remote apply: client_id={} pull_gen={} change_id={:?}",
+            self.main_db_path,
+            self.client_unique_id,
+            local_pull_gen,
+            local_last_change_id,
+        );
+
+        let mut precollected_local_changes = Vec::with_capacity(64);
+        let iterate_opts = DatabaseChangesIteratorOpts {
+            first_change_id: None,
+            last_change_id: pre_apply_local_change_id,
+            mode: DatabaseChangesIteratorMode::Apply,
+            ignore_schema_changes: false,
+            ..Default::default()
+        };
+        let mut iterator = self.main_tape.iterate_changes(iterate_opts)?;
+        while let Some(operation) = iterator.next(coro).await? {
+            match operation {
+                DatabaseTapeOperation::RowChange(change) => precollected_local_changes.push(change),
+                DatabaseTapeOperation::Commit => continue,
+                DatabaseTapeOperation::StmtReplay(_) => {
+                    panic!("changes iterator must not use StmtReplay option")
+                }
+                DatabaseTapeOperation::SchemaReplay(_) => {
+                    panic!("changes iterator must not use SchemaReplay option")
+                }
+            }
+        }
+        tracing::info!(
+            "apply_logical_mvcc_changes(path={}): precollected {} local changes for replay",
+            self.main_db_path,
+            precollected_local_changes.len(),
+        );
+
+        let mut logical_table_names_by_stable_id =
+            self.meta().logical_table_names_by_stable_id.clone();
+        execute_with_schema_retry(&conn, "BEGIN IMMEDIATE").map_err(|error| {
+            Error::DatabaseSyncEngineError(format!(
+                "failed to begin logical MVCC replay transaction: {error}",
+            ))
+        })?;
+
+        let mut remote_logical_touched_rows = BTreeSet::new();
+        let apply_result: Result<(BTreeMap<u64, String>, Option<DatabasePullRevision>)> = async {
+            let mut replay = DatabaseReplaySession {
+                conn: conn.clone(),
+                cached_delete_stmt: HashMap::new(),
+                cached_insert_stmt: HashMap::new(),
+                cached_update_stmt: HashMap::new(),
+                in_txn: true,
+                generator: DatabaseReplayGenerator {
+                    conn: conn.clone(),
+                    opts: DatabaseReplaySessionOpts {
+                        use_implicit_rowid: true,
+                    },
+                },
+            };
+            let replay_stats =
+                apply_logical_transactions_file_without_commit_excluding_client_txns_with_table_map_and_stats(
+                    coro,
+                    &mut replay,
+                    changes_file,
+                    &self.client_unique_id,
+                    &mut logical_table_names_by_stable_id,
+                )
+                .await
+                .map_err(|error| {
+                    Error::DatabaseSyncEngineError(format!(
+                        "failed to apply remote logical transactions: {error}",
+                    ))
+                })?;
+            tracing::info!(
+                "apply_logical_mvcc_changes(path={}): applied logical transactions from remote file; touched_rows={}",
+                self.main_db_path,
+                replay_stats.touched_rows.len(),
+            );
+            remote_logical_touched_rows = replay_stats.touched_rows;
+
+            let (remote_pull_gen, remote_last_change_id) =
+                read_last_change_id(coro, &conn, &self.client_unique_id)
+                    .await
+                    .map_err(|error| {
+                        Error::DatabaseSyncEngineError(format!(
+                            "failed to read last_change_id after logical MVCC remote apply: {error}",
+                        ))
+                    })?;
+            if remote_pull_gen > local_pull_gen {
+                return Err(Error::DatabaseSyncEngineError(format!(
+                    "protocol error: remote_pull_gen > local_pull_gen: {remote_pull_gen} > {local_pull_gen}"
+                )));
+            }
+
+            let last_change_id = resolve_local_replay_floor_change_id(
+                false,
+                true,
+                local_pull_gen,
+                remote_pull_gen,
+                remote_last_change_id,
+                last_pushed_pull_gen_hint,
+                last_pushed_change_id_hint,
+                last_pushed_replay_floor_change_id_hint,
+            );
+            tracing::info!(
+                "apply_logical_mvcc_changes(path={}): local replay floor: local_pull_gen={} remote_pull_gen={} remote_last_change_id={:?} last_pushed_pull_gen_hint={} last_pushed_change_id_hint={} last_pushed_replay_floor_change_id_hint={} resolved_last_change_id={:?}",
+                self.main_db_path,
+                local_pull_gen,
+                remote_pull_gen,
+                remote_last_change_id,
+                last_pushed_pull_gen_hint,
+                last_pushed_change_id_hint,
+                last_pushed_replay_floor_change_id_hint,
+                last_change_id,
+            );
+
+            let replay_floor = last_change_id.unwrap_or(0);
+            let local_changes = precollected_local_changes
+                .into_iter()
+                .filter(|change| change.change_id > replay_floor)
+                .collect::<Vec<_>>();
+            let replaying_pushed_self_range = last_pushed_change_id_hint > 0
+                && last_pushed_replay_floor_change_id_hint < last_pushed_change_id_hint
+                && replay_floor == last_pushed_replay_floor_change_id_hint;
+            let mut skipped_pushed_self_changes_touched_by_remote = 0usize;
+            let local_changes =
+                if replaying_pushed_self_range && !remote_logical_touched_rows.is_empty() {
+                    local_changes
+                        .into_iter()
+                        .filter(|change| {
+                            let already_pushed_self_change =
+                                change.change_id <= last_pushed_change_id_hint;
+                            let touched_by_remote = remote_logical_touched_rows
+                                .contains(&(change.table_name.clone(), change.id));
+                            if already_pushed_self_change && touched_by_remote {
+                                skipped_pushed_self_changes_touched_by_remote += 1;
+                                false
+                            } else {
+                                true
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                } else {
+                    local_changes
+                };
+            let replayed_local_changes = !local_changes.is_empty();
+            let delay_cdc_for_pushed_self_replay = replaying_pushed_self_range && had_cdc_table;
+            let mut recaptured_local_changes = replayed_local_changes;
+            if delay_cdc_for_pushed_self_replay {
+                recaptured_local_changes = false;
+            }
+            let mut preserve_local_replay_floor = None;
+            tracing::info!(
+                "apply_logical_mvcc_changes(path={}): collected {} changes, skipped_pushed_self_changes_touched_by_remote={}",
+                self.main_db_path,
+                local_changes.len(),
+                skipped_pushed_self_changes_touched_by_remote,
+            );
+
+            if !local_changes.is_empty() || had_cdc_table {
+                update_last_change_id(
+                    coro,
+                    &conn,
+                    &self.client_unique_id,
+                    local_pull_gen + 1,
+                    0,
+                )
+                .await
+                .map_err(|error| {
+                    Error::DatabaseSyncEngineError(format!(
+                        "failed to reset sync high-water mark before logical MVCC local replay: {error}",
+                    ))
+                })?;
+
+                let mut cdc_enabled_for_local_replay = false;
+                if replayed_local_changes && had_cdc_table && !delay_cdc_for_pushed_self_replay {
+                    tracing::info!(
+                        "apply_logical_mvcc_changes(path={}): reinitialize CDC pragma before local replay",
+                        self.main_db_path,
+                    );
+                    conn.pragma_update(CDC_PRAGMA_NAME, "'full'")
+                        .map_err(|error| {
+                            Error::DatabaseSyncEngineError(format!(
+                                "failed to reinitialize CDC pragma before logical MVCC local replay: {error}",
+                            ))
+                        })?;
+                    cdc_enabled_for_local_replay = true;
+                }
+
+                let mut replay = DatabaseReplaySession {
+                    conn: conn.clone(),
+                    cached_delete_stmt: HashMap::new(),
+                    cached_insert_stmt: HashMap::new(),
+                    cached_update_stmt: HashMap::new(),
+                    in_txn: true,
+                    generator: DatabaseReplayGenerator {
+                        conn: conn.clone(),
+                        opts: DatabaseReplaySessionOpts {
+                            use_implicit_rowid: false,
+                        },
+                    },
+                };
+
+                let should_transform_local_change = |change: &DatabaseTapeRowChange| {
+                    is_logically_replayable_table(&change.table_name)
+                        && !self
+                            .opts
+                            .tables_ignore
+                            .iter()
+                            .any(|table| table == &change.table_name)
+                };
+                let transform_changes = if self.opts.use_transform {
+                    local_changes
+                        .iter()
+                        .filter(|change| should_transform_local_change(change))
+                        .cloned()
+                        .collect::<Vec<_>>()
+                } else {
+                    Vec::new()
+                };
+                let mut transformed = if self.opts.use_transform {
+                    let ctx = &SyncOperationCtx::new(
+                        coro,
+                        &self.sync_engine_io,
+                        self.meta().remote_url(),
+                        self.opts.remote_encryption_key.as_deref(),
+                    );
+                    Some(apply_transformation(ctx, &transform_changes, &replay.generator).await?)
+                } else {
+                    None
+                };
+                let mut transform_index = 0usize;
+
+                assert!(!replay.conn().get_auto_commit());
+                for change in local_changes {
+                    let should_recapture_change = !delay_cdc_for_pushed_self_replay
+                        || change.change_id > last_pushed_change_id_hint;
+                    let preserve_original_change_floor = should_recapture_change
+                        && matches!(&change.change, DatabaseTapeRowChangeType::Delete { .. });
+                    let original_change_floor = change.change_id.saturating_sub(1);
+                    let operation = if should_transform_local_change(&change) {
+                        if let Some(transformed) = &mut transformed {
+                            let transform_result = std::mem::replace(
+                                &mut transformed[transform_index],
+                                DatabaseRowTransformResult::Skip,
+                            );
+                            transform_index += 1;
+                            match transform_result {
+                                DatabaseRowTransformResult::Keep => {
+                                    DatabaseTapeOperation::RowChange(change)
+                                }
+                                DatabaseRowTransformResult::Skip => continue,
+                                DatabaseRowTransformResult::Rewrite(replay) => {
+                                    DatabaseTapeOperation::StmtReplay(replay)
+                                }
+                            }
+                        } else {
+                            DatabaseTapeOperation::RowChange(change)
+                        }
+                    } else {
+                        DatabaseTapeOperation::RowChange(change)
+                    };
+                    if should_recapture_change && had_cdc_table && !cdc_enabled_for_local_replay {
+                        tracing::info!(
+                            "apply_logical_mvcc_changes(path={}): reinitialize CDC pragma before unpushed local replay",
+                            self.main_db_path,
+                        );
+                        conn.pragma_update(CDC_PRAGMA_NAME, "'full'")
+                            .map_err(|error| {
+                                Error::DatabaseSyncEngineError(format!(
+                                    "failed to reinitialize CDC pragma before logical MVCC unpushed local replay: {error}",
+                                ))
+                            })?;
+                        cdc_enabled_for_local_replay = true;
+                    }
+                    if should_recapture_change {
+                        recaptured_local_changes = true;
+                    }
+                    if preserve_original_change_floor {
+                        preserve_local_replay_floor = Some(
+                            preserve_local_replay_floor.map_or(original_change_floor, |floor: i64| {
+                                floor.min(original_change_floor)
+                            }),
+                        );
+                    }
+                    replay.replay(coro, operation).await.map_err(|error| {
+                        Error::DatabaseSyncEngineError(format!(
+                            "failed to replay local change after logical MVCC remote apply: {error}",
+                        ))
+                    })?;
+                }
+                assert!(!replay.conn().get_auto_commit());
+            }
+
+            conn.execute("COMMIT").map_err(|error| {
+                Error::DatabaseSyncEngineError(format!(
+                    "failed to commit logical MVCC remote apply transaction: {error}",
+                ))
+            })?;
+            conn.publish_schema_if_newer();
+            if had_cdc_table {
+                tracing::info!(
+                    "apply_logical_mvcc_changes(path={}): reinitialize CDC pragma after logical replay commit",
+                    self.main_db_path,
+                );
+                conn.pragma_update(CDC_PRAGMA_NAME, "'full'")
+                    .map_err(|error| {
+                        Error::DatabaseSyncEngineError(format!(
+                            "failed to reinitialize CDC pragma after logical MVCC remote apply: {error}",
+                        ))
+                    })?;
+                conn.publish_schema_if_newer();
+                let change_id = max_local_change_id(coro, &conn).await?.unwrap_or(0);
+                tracing::info!(
+                    "apply_logical_mvcc_changes(path={}): post-logical-replay CDC high-water mark: {}",
+                    self.main_db_path,
+                    change_id
+                );
+                let synced_change_id = synced_change_id_after_remote_apply(
+                    recaptured_local_changes,
+                    pre_apply_local_change_id,
+                    change_id,
+                );
+                let synced_change_id = preserve_local_replay_floor
+                    .map_or(synced_change_id, |floor| synced_change_id.min(floor));
+                update_last_change_id(
+                    coro,
+                    &conn,
+                    &self.client_unique_id,
+                    local_pull_gen + 1,
+                    synced_change_id,
+                )
+                .await?;
+            }
+
+            let logical_table_names_by_stable_id = read_logical_replay_table_map(coro, &conn).await?;
+            Ok((logical_table_names_by_stable_id, None))
+        }
+        .await;
+
+        if apply_result.is_err() && !conn.get_auto_commit() {
+            let _ = conn.execute("ROLLBACK").inspect_err(|rollback_error| {
+                tracing::error!(
+                    "apply_logical_mvcc_changes(path={}): rollback after failed logical apply also failed: {}",
+                    self.main_db_path,
+                    rollback_error
+                );
+            });
+        }
+        apply_result
     }
 
     async fn apply_changes_internal<Ctx>(
@@ -1950,7 +2328,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         // read current pull generation from local table for the given client
         let (local_pull_gen, local_last_change_id) =
             read_last_change_id(coro, &main_conn, &self.client_unique_id).await?;
-        let no_checkpoint_replace_base = replace_base_pages && self.opts.logical_mvcc_pull;
+        let no_checkpoint_replace_base = replace_base_pages && self.meta().logical_mvcc_pull_active;
         tracing::info!(
             "apply_changes(path={}): local sync high-water before remote apply: client_id={} pull_gen={} change_id={:?} replace_base={}",
             self.main_db_path,
@@ -2255,7 +2633,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                     // session used to install the remote page snapshot.
                     logical_replay_conn = Some(conn);
 
-                    if self.opts.logical_mvcc_pull {
+                    if self.meta().logical_mvcc_pull_active {
                         let DatabasePullRevision::V1 { revision } = remote_revision else {
                             return Err(Error::DatabaseSyncEngineError(format!(
                                 "replace-base follow-up logical pull requires a V1 revision, got {remote_revision:?}"
@@ -2925,8 +3303,10 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             self.meta().remote_url(),
             self.opts.remote_encryption_key.as_deref(),
         );
+        let mut push_opts = self.opts.clone();
+        push_opts.logical_mvcc_pull = self.meta().logical_mvcc_pull_active;
         let (pull_gen, replay_floor_change_id, change_id) =
-            push_logical_changes(ctx, &self.main_tape, &self.client_unique_id, &self.opts).await?;
+            push_logical_changes(ctx, &self.main_tape, &self.client_unique_id, &push_opts).await?;
         let main_conn = connect_untracked(&self.main_tape)?;
         update_last_change_id(
             coro,
@@ -2964,7 +3344,13 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         context: &str,
     ) -> Result<()> {
         let main_conn = connect_untracked(&self.main_tape)?;
-        acknowledge_existing_cdc_for_client(coro, &main_conn, &self.client_unique_id, context).await
+        acknowledge_existing_cdc_for_client(coro, &main_conn, &self.client_unique_id, context)
+            .await?;
+        self.update_meta(coro, |m| {
+            m.fresh_bootstrap_pending_cdc_ack = false;
+        })
+        .await?;
+        Ok(())
     }
 
     /// Create read/write database connection and appropriately configure it before use
@@ -3058,6 +3444,9 @@ mod tests {
         REPLACE_BASE_LOCAL_REPLAY_FAILURE_AFTER, WAL_FRAME_HEADER, WAL_FRAME_SIZE,
     };
     use crate::{
+        client_proto::{
+            LogicalOp, LogicalOpType, LogicalSchemaAction, LogicalSchemaKind, LogicalTxnData,
+        },
         database_sync_engine_io::{DataCompletion, DataPollResult, SyncEngineIo},
         database_sync_operations::{
             max_local_change_id, read_last_change_id, update_last_change_id, MutexSlot,
@@ -3066,7 +3455,6 @@ mod tests {
         database_tape::{run_stmt_once, DatabaseChangesIteratorMode, DatabaseChangesIteratorOpts},
         io_operations::IoOperations,
         server_proto::{
-            LogicalOp, LogicalOpType, LogicalSchemaAction, LogicalSchemaKind, LogicalTxnData,
             PullUpdatesApplyMode, PullUpdatesReqProtoBody, PullUpdatesRespProtoBody,
             PullUpdatesStreamKind,
         },
@@ -3511,6 +3899,8 @@ mod tests {
             partial_bootstrap_server_revision: Some(DatabasePullRevision::V1 {
                 revision: "g1:o10".to_string(),
             }),
+            fresh_bootstrap_pending_cdc_ack: false,
+            logical_mvcc_pull_active: false,
             logical_table_names_by_stable_id: Default::default(),
             saved_configuration: Some(DatabaseSavedConfiguration {
                 remote_url: Some("https://example.com".to_string()),
@@ -3592,6 +3982,8 @@ mod tests {
             last_pushed_change_id_hint: 0,
             last_pushed_replay_floor_change_id_hint: 0,
             partial_bootstrap_server_revision: None,
+            fresh_bootstrap_pending_cdc_ack: false,
+            logical_mvcc_pull_active: false,
             logical_table_names_by_stable_id: Default::default(),
             saved_configuration: Some(DatabaseSavedConfiguration {
                 remote_url: Some("https://example.com".to_string()),

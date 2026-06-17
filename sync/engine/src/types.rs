@@ -170,6 +170,13 @@ pub struct DatabaseMetadata {
     #[serde(default)]
     pub last_pushed_replay_floor_change_id_hint: i64,
     pub partial_bootstrap_server_revision: Option<DatabasePullRevision>,
+    /// Fresh bootstrap installed remote pages, but the local CDC high-water
+    /// mark has not yet been advanced past imported remote history.
+    #[serde(default)]
+    pub fresh_bootstrap_pending_cdc_ack: bool,
+    /// Persisted startup decision for raw MVCC logical-log sync.
+    #[serde(default)]
+    pub logical_mvcc_pull_active: bool,
     /// Local identity map for portable MVCC logical replay. Keys are stable
     /// table ids from raw logical-log schema operations; values are the current
     /// table names to use for row replay when row ops omit repeated names.

@@ -1361,15 +1361,9 @@ impl Schema {
 
     #[cfg(feature = "conn_raw_api")]
     pub fn table_name_for_root_page(&self, root_page: i64) -> Option<&str> {
-        if let Some(name) = self.table_names_by_root_page.get(&root_page) {
-            return Some(name.as_str());
-        }
-        self.tables
-            .iter()
-            .find_map(|(name, table)| match table.as_ref() {
-                Table::BTree(table) if table.root_page == root_page => Some(name.as_str()),
-                _ => None,
-            })
+        self.table_names_by_root_page
+            .get(&root_page)
+            .map(String::as_str)
     }
 
     pub fn remove_table(&mut self, table_name: &str) {

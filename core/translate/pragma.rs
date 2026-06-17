@@ -277,8 +277,8 @@ pub fn translate_pragma(
             )?,
         },
         Some(ast::PragmaBody::Call(values)) => {
-            if pragma == PragmaName::MvccLogMeta {
-                update_mvcc_log_meta(values, &connection)?;
+            if pragma == PragmaName::MvccLogMetaConn {
+                update_mvcc_log_meta_conn(values, &connection)?;
                 TransactionMode::None
             } else {
                 let mut values = values.into_iter();
@@ -343,28 +343,72 @@ pub fn translate_pragma(
     Ok(())
 }
 
-fn update_mvcc_log_meta(
+fn update_mvcc_log_meta_conn(
     values: Vec<ast::PragmaValue>,
     connection: &Arc<crate::Connection>,
 ) -> crate::Result<()> {
     if values.len() != 2 {
-        bail_parse_error!("mvcc_log_meta requires key and value arguments");
+        bail_parse_error!("mvcc_log_meta_conn requires key and value arguments");
     }
     let mut values = values.into_iter();
-    let key = parse_string(&values.next().unwrap())?;
+    let key = parse_mvcc_log_meta_conn_string(&values.next().unwrap())?;
     if key.is_empty() {
-        bail_parse_error!("mvcc_log_meta key must not be empty");
+        bail_parse_error!("mvcc_log_meta_conn key must not be empty");
     }
     let value = values.next().unwrap();
-    let value = if matches!(value.as_ref(), Expr::Literal(Literal::Null))
-        || matches!(value.as_ref(), Expr::Literal(Literal::Keyword(keyword)) if keyword.eq_ignore_ascii_case("NULL"))
-    {
-        None
-    } else {
-        Some(parse_string(&value)?)
+    let value = match value.as_ref() {
+        Expr::Literal(Literal::Null) => None,
+        Expr::Literal(Literal::Keyword(keyword)) if keyword.eq_ignore_ascii_case("NULL") => None,
+        Expr::Name(_) | Expr::Literal(Literal::String(_)) => {
+            Some(parse_mvcc_log_meta_conn_string(&value)?)
+        }
+        _ => bail_parse_error!("mvcc_log_meta_conn value must be a string or NULL"),
     };
     connection.set_mvcc_log_meta(key, value);
     Ok(())
+}
+
+fn parse_mvcc_log_meta_conn_string(value: &Expr) -> crate::Result<String> {
+    match value {
+        Expr::Name(name) if name.quoted_with('\'') => parse_string(value),
+        Expr::Literal(Literal::String(value)) => {
+            Ok(ast::Name::from_string(value).as_str().to_string())
+        }
+        _ => bail_parse_error!("mvcc_log_meta_conn argument must be a string"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use turso_parser::ast::Name;
+
+    #[test]
+    fn mvcc_log_meta_conn_string_accepts_parser_string_shapes() {
+        assert_eq!(
+            parse_mvcc_log_meta_conn_string(&Expr::Name(Name::from_string("'client-a'"))).unwrap(),
+            "client-a"
+        );
+        assert_eq!(
+            parse_mvcc_log_meta_conn_string(&Expr::Literal(Literal::String(
+                "'client''b'".to_string()
+            )))
+            .unwrap(),
+            "client'b"
+        );
+    }
+
+    #[test]
+    fn mvcc_log_meta_conn_string_rejects_non_strings() {
+        assert!(
+            parse_mvcc_log_meta_conn_string(&Expr::Name(Name::exact("client-a".to_string())))
+                .is_err()
+        );
+        assert!(
+            parse_mvcc_log_meta_conn_string(&Expr::Literal(Literal::Numeric("1".to_string())))
+                .is_err()
+        );
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -753,8 +797,8 @@ fn update_pragma(
             connection.set_mvcc_checkpoint_threshold(threshold)?;
             Ok(TransactionMode::None)
         }
-        PragmaName::MvccLogMeta => {
-            bail_parse_error!("mvcc_log_meta requires PRAGMA mvcc_log_meta(key, value)")
+        PragmaName::MvccLogMetaConn => {
+            unreachable!("mvcc_log_meta_conn call form is handled before update_pragma")
         }
         PragmaName::ForeignKeys => {
             let enabled = parse_pragma_enabled(&value);
@@ -1590,7 +1634,7 @@ fn query_pragma(
             program.add_pragma_result_column(pragma.to_string());
             Ok(TransactionMode::None)
         }
-        PragmaName::MvccLogMeta => Ok(TransactionMode::None),
+        PragmaName::MvccLogMetaConn => Ok(TransactionMode::None),
         PragmaName::ForeignKeys => {
             let enabled = connection.foreign_keys_enabled();
             let register = program.alloc_register();

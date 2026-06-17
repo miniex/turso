@@ -295,14 +295,14 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
                     Some(io) => io,
                     None => persistent_io(metadata.partial_bootstrap_server_revision.is_some())?,
                 };
-                let (db_file, _server_revision) =
-                    database_sync_engine::DatabaseSyncEngine::init_db_storage(
-                        io.clone(),
-                        sync_engine_io.clone(),
-                        &metadata,
-                        &main_db_path,
-                        sync_engine_opts.remote_encryption_key.as_deref(),
-                    )?;
+                let fresh_bootstrap_pending_cdc_ack = metadata.fresh_bootstrap_pending_cdc_ack;
+                let db_file = database_sync_engine::DatabaseSyncEngine::init_db_storage(
+                    io.clone(),
+                    sync_engine_io.clone(),
+                    &metadata,
+                    &main_db_path,
+                    sync_engine_opts.remote_encryption_key.as_deref(),
+                )?;
                 let main_db = turso_sdk_kit::rsapi::TursoDatabase::new(
                     turso_sdk_kit::rsapi::TursoDatabaseConfig {
                         db_file: Some(db_file),
@@ -320,6 +320,11 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
                     sync_engine_opts,
                 )
                 .await?;
+                if fresh_bootstrap_pending_cdc_ack {
+                    sync_engine_opened
+                        .acknowledge_existing_cdc_for_current_client(&coro, "fresh bootstrap")
+                        .await?;
+                }
                 *sync_engine.lock() = Some(sync_engine_opened);
                 Ok(None)
             })
@@ -342,7 +347,6 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
                     &main_db_path,
                 )
                 .await?;
-                let fresh_bootstrap = metadata.is_none() && sync_engine_opts.bootstrap_if_empty;
                 let io = match io {
                     Some(io) => io,
                     None => persistent_io(if let Some(metadata) = &metadata {
@@ -360,14 +364,14 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
                     metadata,
                 )
                 .await?;
-                let (db_file, _server_revision) =
-                    database_sync_engine::DatabaseSyncEngine::init_db_storage(
-                        io.clone(),
-                        sync_engine_io.clone(),
-                        &metadata,
-                        &main_db_path,
-                        sync_engine_opts.remote_encryption_key.as_deref(),
-                    )?;
+                let fresh_bootstrap_pending_cdc_ack = metadata.fresh_bootstrap_pending_cdc_ack;
+                let db_file = database_sync_engine::DatabaseSyncEngine::init_db_storage(
+                    io.clone(),
+                    sync_engine_io.clone(),
+                    &metadata,
+                    &main_db_path,
+                    sync_engine_opts.remote_encryption_key.as_deref(),
+                )?;
                 let main_db = turso_sdk_kit::rsapi::TursoDatabase::new(
                     turso_sdk_kit::rsapi::TursoDatabaseConfig {
                         db_file: Some(db_file),
@@ -385,7 +389,7 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
                     sync_engine_opts,
                 )
                 .await?;
-                if fresh_bootstrap {
+                if fresh_bootstrap_pending_cdc_ack {
                     sync_engine_opened
                         .acknowledge_existing_cdc_for_current_client(&coro, "fresh bootstrap")
                         .await?;

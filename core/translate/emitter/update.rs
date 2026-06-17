@@ -2276,7 +2276,8 @@ fn emit_update_insns<'a>(
                 None
             };
 
-            // create full CDC record before update if necessary
+            // `capture_data_changes_info` is connection-wide. `cdc_cursor_id`
+            // is present only when this UPDATE targets a captured table.
             let cdc_before_reg = if t_ctx.cdc_cursor_id.is_some()
                 && program.capture_data_changes_info().has_before()
             {
