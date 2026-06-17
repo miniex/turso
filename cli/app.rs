@@ -439,6 +439,10 @@ impl Limbo {
         self.conn.clone()
     }
 
+    pub fn get_db_file(&self) -> String {
+        self.opts.db_file.clone()
+    }
+
     pub fn is_mcp_mode(&self) -> bool {
         self.opts.mcp
     }

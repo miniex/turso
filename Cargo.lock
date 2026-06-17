@@ -6599,6 +6599,7 @@ dependencies = [
  "clap",
  "clap_complete",
  "comfy-table",
+ "crc32c",
  "csv",
  "ctrlc",
  "dirs 5.0.1",

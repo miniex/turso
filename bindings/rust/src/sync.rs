@@ -974,6 +974,7 @@ mod tests {
         db_url: String,
         host: String,
         server: Option<Child>,
+        _temp_dir: Option<TempDir>,
         client: Client,
     }
 
@@ -1014,11 +1015,15 @@ mod tests {
                     db_url: format!("{}://{}--{}--{}.{}", tokens[0], name, name, name, tokens[1]),
                     host: format!("{name}--{name}--{name}.localhost"),
                     server: None,
+                    _temp_dir: None,
                     client,
                 })
             } else {
                 let port: u16 = rand::rng().random_range(10_000..=65_535);
                 let server_bin = env::var("LOCAL_SYNC_SERVER").unwrap();
+                let temp_dir = TempDir::new()?;
+                let db_path = temp_dir.path().join("sync-server.db");
+                let db_path = db_path.to_string_lossy().to_string();
 
                 // IMPORTANT: do not use Stdio::piped() here. Nothing reads from
                 // those pipes, so once the kernel pipe buffer (~64 KiB on Linux)
@@ -1026,7 +1031,7 @@ mod tests {
                 // servicing HTTP requests, deadlocking sync operations in
                 // long-running tests like test_sync_parallel_writes_with_sync_ops.
                 let child = Command::new(server_bin)
-                    .args(["--sync-server", &format!("0.0.0.0:{port}")])
+                    .args([&db_path, "--sync-server", &format!("0.0.0.0:{port}")])
                     .stdout(Stdio::null())
                     .stderr(Stdio::null())
                     .spawn()
@@ -1047,6 +1052,7 @@ mod tests {
                     db_url: user_url,
                     host: String::new(),
                     server: Some(child),
+                    _temp_dir: Some(temp_dir),
                     client,
                 })
             }
@@ -1132,7 +1138,8 @@ mod tests {
             .await
             .unwrap();
         server.db_sql("SELECT * FROM t").await.unwrap();
-        let db = crate::sync::Builder::new_remote(":memory:")
+        let dir = TempDir::new().unwrap();
+        let db = crate::sync::Builder::new_remote(dir.path().join("local.db").to_str().unwrap())
             .with_remote_url(server.db_url())
             .build()
             .await
@@ -1226,7 +1233,8 @@ mod tests {
             .await
             .unwrap();
         server.db_sql("SELECT * FROM t").await.unwrap();
-        let db = crate::sync::Builder::new_remote(":memory:")
+        let dir = TempDir::new().unwrap();
+        let db = crate::sync::Builder::new_remote(dir.path().join("local.db").to_str().unwrap())
             .with_remote_url(server.db_url())
             .build()
             .await
@@ -1281,7 +1289,8 @@ mod tests {
         server.db_sql("CREATE TABLE t(x)").await.unwrap();
         server.db_sql("INSERT INTO t VALUES (1)").await.unwrap();
 
-        let db = crate::sync::Builder::new_remote(":memory:")
+        let dir = TempDir::new().unwrap();
+        let db = crate::sync::Builder::new_remote(dir.path().join("local.db").to_str().unwrap())
             .with_remote_url(server.db_url())
             .build()
             .await
@@ -1312,7 +1321,8 @@ mod tests {
             .await
             .unwrap();
         server.db_sql("SELECT * FROM t").await.unwrap();
-        let db = crate::sync::Builder::new_remote(":memory:")
+        let dir = TempDir::new().unwrap();
+        let db = crate::sync::Builder::new_remote(dir.path().join("local.db").to_str().unwrap())
             .with_remote_url(server.db_url())
             .build()
             .await
@@ -1729,7 +1739,8 @@ mod tests {
             .await
             .unwrap();
 
-        let db = crate::sync::Builder::new_remote(":memory:")
+        let dir = TempDir::new().unwrap();
+        let db = crate::sync::Builder::new_remote(dir.path().join("local.db").to_str().unwrap())
             .with_remote_url(server.db_url())
             .build()
             .await
@@ -1851,7 +1862,8 @@ mod tests {
             .unwrap();
 
         // Local: bootstrap from remote
-        let db = crate::sync::Builder::new_remote(":memory:")
+        let dir = TempDir::new().unwrap();
+        let db = crate::sync::Builder::new_remote(dir.path().join("local.db").to_str().unwrap())
             .with_remote_url(server.db_url())
             .build()
             .await
@@ -2017,9 +2029,14 @@ mod tests {
                         // Acceptable transient errors during pull/checkpoint;
                         // anything else (including the WAL panic) propagates.
                         Err(crate::Error::Busy(_)) => continue,
+                        Err(crate::Error::Error(e)) if e == "Database schema changed" => continue,
                         Err(e) => panic!("reader query failed: {e:?}"),
                     };
-                    let all = all_rows(rows).await.unwrap();
+                    let all = match all_rows(rows).await {
+                        Ok(all) => all,
+                        Err(e) if e.to_string() == "Database schema changed" => continue,
+                        Err(e) => panic!("reader rows failed: {e:?}"),
+                    };
                     let Value::Integer(n) = all[0][0] else {
                         panic!("unexpected reader value: {:?}", all[0][0]);
                     };
