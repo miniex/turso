@@ -10333,6 +10333,30 @@ mod tests {
                 })],
             ),
             (
+                b"PRAGMA table_info(users)".as_slice(),
+                vec![Cmd::Stmt(Stmt::Pragma {
+                    name: QualifiedName { db_name: None, name: Name::exact("table_info".to_owned()),  alias: None },
+                    body: Some(PragmaBody::Call(vec![Box::new(Expr::Name(Name::exact("users".to_owned())))])),
+                })],
+            ),
+            (
+                b"PRAGMA mvcc_log_meta_conn('client', NULL)".as_slice(),
+                vec![Cmd::Stmt(Stmt::Pragma {
+                    name: QualifiedName { db_name: None, name: Name::exact("mvcc_log_meta_conn".to_owned()),  alias: None },
+                    body: Some(PragmaBody::Call(vec![
+                        Box::new(Expr::Literal(Literal::String("'client'".to_owned()))),
+                        Box::new(Expr::Literal(Literal::Keyword("NULL".to_owned()))),
+                    ])),
+                })],
+            ),
+            (
+                b"PRAGMA mvcc_log_meta_conn()".as_slice(),
+                vec![Cmd::Stmt(Stmt::Pragma {
+                    name: QualifiedName { db_name: None, name: Name::exact("mvcc_log_meta_conn".to_owned()),  alias: None },
+                    body: Some(PragmaBody::Call(vec![])),
+                })],
+            ),
+            (
                 b"PRAGMA foreign_keys".as_slice(),
                 vec![Cmd::Stmt(Stmt::Pragma {
                     name: QualifiedName { db_name: None, name: Name::exact("foreign_keys".to_owned()),  alias: None },
