@@ -1974,7 +1974,9 @@ impl Database {
                 "new WAL state unexpectedly shared during external restore reload".to_string(),
             )
         })?;
-        *self.shared_wal.write() = new_shared_wal.into_inner();
+        self.shared_wal
+            .write()
+            .replace_after_external_restore(new_shared_wal.into_inner());
         if self.mvcc_enabled() || journal_mode::logical_log_exists(std::path::Path::new(&self.path))
         {
             let mv_store = journal_mode::open_mv_store(

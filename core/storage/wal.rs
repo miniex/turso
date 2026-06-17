@@ -5548,6 +5548,26 @@ impl WalFileShared {
             lock.set_value_exclusive(READMARK_NOT_USED);
         }
     }
+    /// Replace restored WAL state while preserving process-local locks owned by
+    /// existing connections.
+    ///
+    /// External restore paths rebuild metadata/cache/file state from disk while
+    /// other connections may still hold read guards. Those guards are tied to
+    /// the process-local lock objects, not to the restored on-disk WAL view, so
+    /// replacing the lock objects would make normal `end_read_tx` unlock a fresh
+    /// empty lock. Keep lock identity stable and refresh only state derived from
+    /// storage.
+    #[cfg(feature = "conn_raw_api")]
+    pub fn replace_after_external_restore(&mut self, restored: WalFileShared) {
+        self.metadata = restored.metadata;
+        self.runtime.frame_cache = restored.runtime.frame_cache;
+        self.runtime.file = restored.runtime.file;
+        self.runtime.epoch.store(
+            restored.runtime.epoch.load(Ordering::Acquire),
+            Ordering::Release,
+        );
+        self.runtime.overflow_fallback_coverage = restored.runtime.overflow_fallback_coverage;
+    }
 }
 
 #[cfg(test)]
